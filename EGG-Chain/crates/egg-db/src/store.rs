@@ -66,7 +66,6 @@ impl<S: KvStore> DbChainStore<S> {
     }
 
     fn encode_tip(tip: ChainTip) -> Vec<u8> {
-        // 8 (magic) + 8 (height u64) + 32 (hash)
         const MAGIC: [u8; 8] = *b"EGG_TIP0";
         let mut out = Vec::with_capacity(48);
         out.extend_from_slice(&MAGIC);
@@ -114,7 +113,7 @@ impl<S: KvStore> BlockStore for DbChainStore<S> {
     }
 
     fn has_header(&self, id: Hash256) -> Result<bool> {
-        Ok(self.kv.has(&Self::k_header(id)))
+        Ok(self.kv.has(&Self::k_header(id))?)
     }
 
     fn put_block(&self, id: Hash256, block: &Block) -> Result<()> {
@@ -131,7 +130,7 @@ impl<S: KvStore> BlockStore for DbChainStore<S> {
     }
 
     fn has_block(&self, id: Hash256) -> Result<bool> {
-        Ok(self.kv.has(&Self::k_block(id)))
+        Ok(self.kv.has(&Self::k_block(id))?)
     }
 }
 
@@ -145,7 +144,7 @@ impl<S: KvStore> ChainStore for DbChainStore<S> {
 
     fn get_tip(&self) -> Result<Option<ChainTip>> {
         let key = Self::k_tip();
-        if !self.kv.has(key) {
+        if !self.kv.has(key)? {
             return Ok(None);
         }
         let val = self.kv.get(key)?;

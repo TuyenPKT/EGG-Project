@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
+
 use egg_chain::state::ChainState;
 use egg_db::store::DbChainStore;
-use egg_db::MemKv;
+use egg_db::SledKv;
 use egg_types::{ChainParams, ChainSpec, GenesisSpec};
 
 fn main() {
@@ -14,8 +16,11 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // BƯỚC 4: khởi tạo chainstate theo spec cố định để đảm bảo init DB/genesis/tip hoạt động.
-    // (BƯỚC sau sẽ thêm cấu hình/đường dẫn persistent store và nạp spec từ file.)
+    // BƯỚC 5: DB bền vững mặc định (sled) trên disk.
+    // Đường dẫn mặc định: EGG-Project/EGG-Chain/data/egg-node (tính theo working dir = EGG-Chain).
+    let db_dir: PathBuf = PathBuf::from("data").join("egg-node");
+    std::fs::create_dir_all(&db_dir)?;
+
     let spec = ChainSpec {
         spec_version: 1,
         chain: ChainParams {
@@ -29,7 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let kv = MemKv::new();
+    let kv = SledKv::open(&db_dir)?;
     let store = DbChainStore::new(kv);
 
     let state = ChainState::open_or_init(store, spec)?;
