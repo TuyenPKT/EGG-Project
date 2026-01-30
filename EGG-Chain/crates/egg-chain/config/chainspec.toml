@@ -1,0 +1,11 @@
+spec_version = 1
+
+[chain]
+chain_name = "EGG-MAINNET"
+chain_id = 1
+
+[genesis]
+# Mainnet_Official_Start = genesis block timestamp (UTC seconds)
+timestamp_utc = 1700000000
+pow_difficulty_bits = 0
+nonce = 0

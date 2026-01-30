@@ -39,29 +39,23 @@ pub struct ChainState<S: ChainStore + Clone> {
     store: S,
 }
 
-// Debug thủ công để:
-// - không yêu cầu S: Debug
-// - đảm bảo tests có thể dùng unwrap_err() (Result<T,E>::unwrap_err yêu cầu T: Debug)
-impl<S: ChainStore + Clone> core::fmt::Debug for ChainState<S> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ChainState")
-            .field("spec", &self.spec)
-            .field("tip", &self.tip)
-            .finish_non_exhaustive()
-    }
-}
-
 impl<S: ChainStore + Clone> ChainState<S> {
     pub fn store(&self) -> &S {
         &self.store
     }
 
+    /// Mở chainstate từ store.
+    /// - Nếu chưa có tip: init genesis (header+block+tip)
+    /// - Nếu đã có tip: verify tối thiểu
+    ///
+    /// Idempotent: gọi lặp lại với cùng store + spec sẽ không tạo lại genesis.
     pub fn open_or_init(store: S, spec: ChainSpec) -> Result<Self> {
         validate_chainspec(&spec)?;
 
         match store.get_tip()? {
             Some(tip) => {
-                // Invariant mạnh: nếu height=0 thì tip MUST là genesis theo spec.
+                // Quy tắc ưu tiên: nếu height=0 thì tip BẮT BUỘC là genesis theo spec.
+                // Điều này cần trả lỗi rõ ràng trước khi check dữ liệu block/header có tồn tại không.
                 if tip.height == Height(0) {
                     let gid = genesis_id(&spec)?;
                     if tip.hash != gid {
@@ -80,9 +74,11 @@ impl<S: ChainStore + Clone> ChainState<S> {
                 Ok(Self { spec, tip, store })
             }
             None => {
+                // Init genesis
                 let hdr = genesis_header(&spec)?;
                 let gid = genesis_id(&spec)?;
 
+                // Consistency check: header_id(genesis_header) phải đúng gid
                 let computed = crate::header_id(&hdr);
                 if computed != gid {
                     return Err(ChainStateError::GenesisIdMismatch {
@@ -91,7 +87,7 @@ impl<S: ChainStore + Clone> ChainState<S> {
                     });
                 }
 
-                // Genesis block: tx list rỗng (deterministic)
+                // Genesis block deterministic: tx list rỗng.
                 let blk = egg_types::Block {
                     header: hdr.clone(),
                     txs: vec![],
@@ -110,6 +106,7 @@ impl<S: ChainStore + Clone> ChainState<S> {
         }
     }
 
+    /// Verify genesis đã lưu trong store khớp spec hiện tại.
     pub fn verify_genesis_matches_spec(&self) -> Result<()> {
         let gid = genesis_id(&self.spec)?;
         let hdr_expected = genesis_header(&self.spec)?;
@@ -128,7 +125,7 @@ mod tests {
     use egg_db::{MemKv, SledKv};
     use egg_types::{ChainParams, GenesisSpec};
 
-    fn mk_spec() -> ChainSpec {
+    fn mk_spec(ts: i64) -> ChainSpec {
         ChainSpec {
             spec_version: 1,
             chain: ChainParams {
@@ -136,7 +133,7 @@ mod tests {
                 chain_id: 1,
             },
             genesis: GenesisSpec {
-                timestamp_utc: 1_700_000_000,
+                timestamp_utc: ts,
                 pow_difficulty_bits: 0,
                 nonce: 0,
             },
@@ -147,14 +144,13 @@ mod tests {
     fn open_or_init_creates_genesis_when_empty() {
         let kv = MemKv::new();
         let store = DbChainStore::new(kv);
-        let spec = mk_spec();
+        let spec = mk_spec(1_700_000_000);
 
         let st = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
         assert_eq!(st.tip.height, Height(0));
 
         let gid = genesis_id(&spec).unwrap();
         assert_eq!(st.tip.hash, gid);
-
         assert!(st.store().has_header(gid).unwrap());
         assert!(st.store().has_block(gid).unwrap());
 
@@ -165,7 +161,7 @@ mod tests {
     fn open_or_init_is_idempotent_in_memkv() {
         let kv = MemKv::new();
         let store = DbChainStore::new(kv);
-        let spec = mk_spec();
+        let spec = mk_spec(1_700_000_000);
 
         let st1 = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
         let st2 = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
@@ -187,7 +183,7 @@ mod tests {
     fn open_or_init_rejects_tip_height0_not_genesis() {
         let kv = MemKv::new();
         let store = DbChainStore::new(kv);
-        let spec = mk_spec();
+        let spec = mk_spec(1_700_000_000);
 
         let _ = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
 
@@ -197,17 +193,20 @@ mod tests {
         };
         store.set_tip(bad_tip).unwrap();
 
-        let err = ChainState::open_or_init(store.clone(), spec.clone()).unwrap_err();
+        let err = match ChainState::open_or_init(store.clone(), spec.clone()) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
         assert!(matches!(err, ChainStateError::TipNotGenesisAtHeight0));
     }
 
     #[test]
     fn persistent_restart_keeps_tip_and_genesis() {
-        let spec = mk_spec();
+        let spec = mk_spec(1_700_000_000);
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("sled-db");
 
-        // First start
+        // First start: init genesis + tip
         {
             let kv = SledKv::open(&db_path).unwrap();
             let store = DbChainStore::new(kv);
@@ -216,7 +215,7 @@ mod tests {
             assert_eq!(st1.tip.height, Height(0));
         }
 
-        // Restart
+        // Restart: reopen same path, must load existing tip and not re-init
         {
             let kv = SledKv::open(&db_path).unwrap();
             let store = DbChainStore::new(kv);
@@ -229,6 +228,35 @@ mod tests {
 
             assert!(store.has_header(gid).unwrap());
             assert!(store.has_block(gid).unwrap());
+        }
+    }
+
+    #[test]
+    fn persistent_restart_rejects_changed_chainspec() {
+        let spec_a = mk_spec(1_700_000_000);
+        let spec_b = mk_spec(1_700_000_001);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sled-db");
+
+        // Start with spec A
+        {
+            let kv = SledKv::open(&db_path).unwrap();
+            let store = DbChainStore::new(kv);
+            let st = ChainState::open_or_init(store.clone(), spec_a.clone()).unwrap();
+            st.verify_genesis_matches_spec().unwrap();
+            assert_eq!(st.tip.height, Height(0));
+        }
+
+        // Restart with spec B must be rejected
+        {
+            let kv = SledKv::open(&db_path).unwrap();
+            let store = DbChainStore::new(kv);
+            let err = match ChainState::open_or_init(store.clone(), spec_b.clone()) {
+                Ok(_) => panic!("expected error"),
+                Err(e) => e,
+            };
+            assert!(matches!(err, ChainStateError::TipNotGenesisAtHeight0));
         }
     }
 }
