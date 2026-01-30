@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/egg-types",
+  "crates/egg-crypto",
+  "crates/egg-db",
+  "crates/egg-chain",
+  "crates/egg-net",
+  "crates/egg-rpc",
+  "crates/egg-node",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"

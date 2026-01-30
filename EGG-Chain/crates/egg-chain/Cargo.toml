@@ -1,0 +1,16 @@
+[package]
+name = "egg-chain"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+egg-crypto = { path = "../egg-crypto" }
+egg-types = { path = "../egg-types" }
+egg-db = { path = "../egg-db" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

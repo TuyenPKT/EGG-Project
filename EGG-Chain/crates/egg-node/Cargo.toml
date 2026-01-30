@@ -1,0 +1,15 @@
+[package]
+name = "egg-node"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+egg-chain = { path = "../egg-chain" }
+egg-crypto = { path = "../egg-crypto" }
+egg-db = { path = "../egg-db" }
+egg-net = { path = "../egg-net" }
+egg-rpc = { path = "../egg-rpc" }
+egg-types = { path = "../egg-types" }
+
+[dev-dependencies]
