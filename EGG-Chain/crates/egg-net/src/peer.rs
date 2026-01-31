@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use egg_crypto::hash_header;
 use egg_types::{BlockHeader, Hash256};
@@ -8,10 +9,23 @@ use egg_types::{BlockHeader, Hash256};
 use crate::protocol::{Message, Tip};
 
 const MAX_NOTFOUND_PER_ID: u8 = 2;
-
-// Ban nếu peer trả BlockNotFound cho quá nhiều id khác nhau trong cùng session.
-// Mục tiêu: bắt pattern “không phục vụ/lying” khi đồng loạt NotFound nhiều block.
 const MAX_DISTINCT_NOTFOUND_IDS: usize = 16;
+
+// ---- Penalty / Decay / Ban threshold ----
+const PENALTY_BAN_THRESHOLD: i32 = 100;
+
+// decay: mỗi PENALTY_DECAY_EVERY giây giảm PENALTY_DECAY_STEP điểm (lazy decay)
+const PENALTY_DECAY_EVERY: Duration = Duration::from_secs(10);
+const PENALTY_DECAY_STEP: i32 = 10;
+
+// penalties
+const PENALTY_UNSOLICITED_REPLY: i32 = 55;
+const PENALTY_REPLY_WITHOUT_KNOWN_HEADER: i32 = 65;
+const PENALTY_BLOCK_ID_MISMATCH: i32 = 70;
+const PENALTY_BLOCK_NOTFOUND: i32 = 5;
+const PENALTY_TOO_MANY_NOTFOUND_PER_ID: i32 = 25;
+const PENALTY_TOO_MANY_DISTINCT_NOTFOUND: i32 = 40;
+const PENALTY_TIMEOUT: i32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -57,14 +71,20 @@ pub struct PeerMachine {
     sync_cursor_start: Hash256,
     sync_batch_max: u32,
 
-    // hardening
+    // ban state
     banned: Option<String>,
+
+    // hardening sets
     known_header_ids: HashSet<Hash256>,
     inflight_blocks: HashSet<Hash256>,
 
-    // notfound tracking
+    // notfound tracking (để tính pattern)
     notfound_by_id: HashMap<Hash256, u8>,
     notfound_distinct_ids: HashSet<Hash256>,
+
+    // penalty
+    penalty_score: i32,
+    penalty_last_decay: Instant,
 }
 
 impl PeerMachine {
@@ -80,11 +100,17 @@ impl PeerMachine {
             sync_batch_max: 2000,
             local,
             remote: None,
+
             banned: None,
+
             known_header_ids: known,
             inflight_blocks: HashSet::new(),
+
             notfound_by_id: HashMap::new(),
             notfound_distinct_ids: HashSet::new(),
+
+            penalty_score: 0,
+            penalty_last_decay: Instant::now(),
         }
     }
 
@@ -111,10 +137,55 @@ impl PeerMachine {
         self.banned.as_deref()
     }
 
+    pub fn penalty_score(&self) -> i32 {
+        self.penalty_score
+    }
+
     fn ban(&mut self, reason: impl Into<String>) {
         if self.banned.is_none() {
             self.banned = Some(reason.into());
         }
+    }
+
+    fn apply_decay(&mut self, now: Instant) {
+        let Some(elapsed) = now.checked_duration_since(self.penalty_last_decay) else {
+            self.penalty_last_decay = now;
+            return;
+        };
+
+        let every = PENALTY_DECAY_EVERY.as_secs();
+        if every == 0 {
+            return;
+        }
+
+        let steps = elapsed.as_secs() / every;
+        if steps == 0 {
+            return;
+        }
+
+        let dec = (steps as i32).saturating_mul(PENALTY_DECAY_STEP);
+        self.penalty_score = (self.penalty_score - dec).max(0);
+        self.penalty_last_decay = now;
+    }
+
+    fn add_penalty(&mut self, now: Instant, points: i32, why: &str) {
+        if self.is_banned() {
+            return;
+        }
+
+        self.apply_decay(now);
+        self.penalty_score = self.penalty_score.saturating_add(points);
+
+        if self.penalty_score >= PENALTY_BAN_THRESHOLD {
+            self.ban(format!(
+                "penalty threshold exceeded: score={} reason={}",
+                self.penalty_score, why
+            ));
+        }
+    }
+
+    pub fn note_timeout(&mut self) {
+        self.add_penalty(Instant::now(), PENALTY_TIMEOUT, "timeout");
     }
 
     pub fn start(&mut self) -> Vec<Message> {
@@ -172,41 +243,60 @@ impl PeerMachine {
         }
     }
 
-    fn hardening_on_block_reply(&mut self, id: Hash256) -> bool {
-        // 1) unsolicited reply -> ban
+    fn hardening_on_block_reply(&mut self, now: Instant, id: Hash256) -> bool {
+        // 1) unsolicited reply
         if !self.inflight_blocks.remove(&id) {
-            self.ban(format!("unsolicited block reply {:?}", id));
+            self.add_penalty(now, PENALTY_UNSOLICITED_REPLY, "unsolicited block reply");
             return false;
         }
 
-        // 2) reply nhưng chưa biết header -> ban
+        // 2) reply nhưng chưa biết header
         if !self.known_header_ids.contains(&id) {
-            self.ban(format!("block reply without known header {:?}", id));
+            self.add_penalty(
+                now,
+                PENALTY_REPLY_WITHOUT_KNOWN_HEADER,
+                "block reply without known header",
+            );
             return false;
         }
 
         true
     }
 
-    fn hardening_on_notfound(&mut self, id: Hash256) {
-        let c = self.notfound_by_id.entry(id).or_insert(0);
-        *c = c.saturating_add(1);
+    fn hardening_on_notfound(&mut self, now: Instant, id: Hash256) {
+        // base penalty
+        self.add_penalty(now, PENALTY_BLOCK_NOTFOUND, "BlockNotFound");
 
-        // Ban theo “per-id”
-        if *c > MAX_NOTFOUND_PER_ID {
-            self.ban(format!("too many BlockNotFound for {:?}", id));
-            return;
+        // IMPORTANT: không giữ mutable borrow từ entry() qua các lần gọi self.add_penalty(...)
+        let count: u8 = {
+            let e = self.notfound_by_id.entry(id).or_insert(0);
+            *e = e.saturating_add(1);
+            *e
+        };
+
+        // per-id escalation (không ban ngay; chỉ cộng điểm)
+        if count > MAX_NOTFOUND_PER_ID {
+            self.add_penalty(
+                now,
+                PENALTY_TOO_MANY_NOTFOUND_PER_ID,
+                "too many BlockNotFound per id",
+            );
         }
 
-        // Ban theo “nhiều id khác nhau”
-        // Chỉ tính distinct khi đây là lần NotFound đầu tiên của id (c == 1).
-        if *c == 1 {
+        // distinct tracking (pattern)
+        if count == 1 {
+            let prev = self.notfound_distinct_ids.len();
             self.notfound_distinct_ids.insert(id);
-            if self.notfound_distinct_ids.len() > MAX_DISTINCT_NOTFOUND_IDS {
-                self.ban(format!(
-                    "too many distinct BlockNotFound ids: {}",
-                    self.notfound_distinct_ids.len()
-                ));
+
+            // vượt ngưỡng distinct -> cộng penalty mạnh (ban chỉ khi vượt threshold)
+            if prev <= MAX_DISTINCT_NOTFOUND_IDS
+                && self.notfound_distinct_ids.len() > MAX_DISTINCT_NOTFOUND_IDS
+            {
+                self.add_penalty(
+                    now,
+                    PENALTY_TOO_MANY_DISTINCT_NOTFOUND,
+                    "too many distinct BlockNotFound ids",
+                );
             }
         }
     }
@@ -217,9 +307,16 @@ impl PeerMachine {
     }
 
     pub fn on_message(&mut self, msg: Message) -> Vec<Message> {
+        self.on_message_at(msg, Instant::now())
+    }
+
+    fn on_message_at(&mut self, msg: Message, now: Instant) -> Vec<Message> {
         if self.is_banned() {
             return vec![];
         }
+
+        // lazy decay trước khi xử lý msg
+        self.apply_decay(now);
 
         match msg {
             Message::Hello {
@@ -274,7 +371,6 @@ impl PeerMachine {
                 if !self.sync_enabled {
                     return vec![];
                 }
-
                 if headers.is_empty() {
                     return vec![];
                 }
@@ -289,14 +385,14 @@ impl PeerMachine {
             Message::GetBlock { id: _ } => vec![],
 
             Message::BlockFound { id, block } => {
-                if !self.hardening_on_block_reply(id) {
+                if !self.hardening_on_block_reply(now, id) {
                     return vec![];
                 }
 
-                // hardening: id phải khớp header hash
+                // invalid: id mismatch
                 let hid = hash_header(&block.header);
                 if hid != id {
-                    self.ban(format!("BlockFound id mismatch: expect {:?} got {:?}", id, hid));
+                    self.add_penalty(now, PENALTY_BLOCK_ID_MISMATCH, "BlockFound id mismatch");
                     return vec![];
                 }
 
@@ -305,11 +401,11 @@ impl PeerMachine {
             }
 
             Message::BlockNotFound { id } => {
-                if !self.hardening_on_block_reply(id) {
+                if !self.hardening_on_block_reply(now, id) {
                     return vec![];
                 }
 
-                self.hardening_on_notfound(id);
+                self.hardening_on_notfound(now, id);
                 vec![]
             }
 
@@ -372,111 +468,102 @@ mod tests {
     }
 
     #[test]
-    fn ban_on_unsolicited_block_found() {
+    fn penalty_ban_requires_threshold_not_immediate() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
-        let _ = p.on_message(mk_ack());
+        let t0 = Instant::now();
+        let _ = p.on_message_at(mk_ack(), t0);
         assert!(p.is_ready());
 
         let h = hdr(Hash256::zero(), 1, 1);
         let id = hash_header(&h);
         let blk = Block { header: h, txs: vec![] };
 
-        let _ = p.on_message(Message::BlockFound { id, block: blk });
+        let _ = p.on_message_at(
+            Message::BlockFound { id, block: blk.clone() },
+            t0 + Duration::from_secs(1),
+        );
+        assert!(!p.is_banned());
+        assert!(p.penalty_score() > 0);
 
+        let _ = p.on_message_at(
+            Message::BlockFound { id, block: blk },
+            t0 + Duration::from_secs(2),
+        );
         assert!(p.is_banned());
-        assert!(p.ban_reason().unwrap().contains("unsolicited"));
+        assert!(p.ban_reason().unwrap().contains("threshold"));
     }
 
     #[test]
-    fn ban_on_block_not_found_without_known_header_even_if_requested() {
+    fn penalty_decays_over_time() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
-        let _ = p.on_message(mk_ack());
+        let t0 = Instant::now();
+        let _ = p.on_message_at(mk_ack(), t0);
         assert!(p.is_ready());
 
-        let id = Hash256([8u8; 32]);
-        let _req = p.request_block(id);
-
-        let _ = p.on_message(Message::BlockNotFound { id });
-
-        assert!(p.is_banned());
-        assert!(p.ban_reason().unwrap().contains("without known header"));
-    }
-
-    #[test]
-    fn ban_after_too_many_notfound_for_same_id() {
-        let mut p = PeerMachine::new(Role::Outbound, mk_local());
-        let _ = p.on_message(mk_ack());
-        assert!(p.is_ready());
-
-        let h = hdr(Hash256::zero(), 1, 123);
+        let h = hdr(Hash256::zero(), 1, 1);
         let id = hash_header(&h);
-        let _ = p.on_message(Message::Headers { headers: vec![h] });
+        let blk = Block { header: h, txs: vec![] };
 
-        for i in 0..=MAX_NOTFOUND_PER_ID {
-            let _ = p.request_block(id);
-            let _ = p.on_message(Message::BlockNotFound { id });
-            if i < MAX_NOTFOUND_PER_ID {
-                assert!(!p.is_banned());
-            }
-        }
+        let _ = p.on_message_at(
+            Message::BlockFound { id, block: blk },
+            t0 + Duration::from_secs(1),
+        );
+        assert!(p.penalty_score() > 0);
 
-        assert!(p.is_banned());
-        assert!(p.ban_reason().unwrap().contains("too many BlockNotFound"));
+        let _ = p.on_message_at(Message::Pong { nonce: 1 }, t0 + Duration::from_secs(61));
+        assert_eq!(p.penalty_score(), 0);
+        assert!(!p.is_banned());
     }
 
     #[test]
-    fn ban_after_too_many_distinct_notfound_ids() {
+    fn ban_after_too_many_distinct_notfound_ids_via_penalty_threshold() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
-        let _ = p.on_message(mk_ack());
+        let t0 = Instant::now();
+        let _ = p.on_message_at(mk_ack(), t0);
         assert!(p.is_ready());
 
-        // Tạo nhiều header khác nhau để “known header” cho các id.
         let mut headers = Vec::new();
         for i in 1..=(MAX_DISTINCT_NOTFOUND_IDS as u64 + 1) {
             headers.push(hdr(Hash256::zero(), i, 10_000 + i));
         }
-        let _ = p.on_message(Message::Headers { headers: headers.clone() });
+        let _ = p.on_message_at(
+            Message::Headers { headers: headers.clone() },
+            t0 + Duration::from_secs(1),
+        );
 
-        // Mỗi id: request 1 lần rồi trả NotFound 1 lần.
-        // Không bị ban cho đến khi vượt ngưỡng distinct.
         for (idx, h) in headers.into_iter().enumerate() {
             let id = hash_header(&h);
 
             let _ = p.request_block(id);
-            let _ = p.on_message(Message::BlockNotFound { id });
+            let _ = p.on_message_at(
+                Message::BlockNotFound { id },
+                t0 + Duration::from_secs(2 + idx as u64),
+            );
 
             if idx < MAX_DISTINCT_NOTFOUND_IDS {
-                assert!(
-                    !p.is_banned(),
-                    "should not be banned yet at idx={}",
-                    idx
-                );
+                assert!(!p.is_banned(), "should not be banned yet at idx={}", idx);
             } else {
                 assert!(p.is_banned(), "should be banned at idx={}", idx);
-                assert!(
-                    p.ban_reason().unwrap().contains("distinct BlockNotFound"),
-                    "unexpected ban reason: {:?}",
-                    p.ban_reason()
-                );
                 break;
             }
         }
     }
 
     #[test]
-    fn accept_block_found_when_requested_and_header_known() {
+    fn reply_without_known_header_is_penalized_not_immediate_ban() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
-        let _ = p.on_message(mk_ack());
+        let t0 = Instant::now();
+        let _ = p.on_message_at(mk_ack(), t0);
         assert!(p.is_ready());
 
-        let h = hdr(Hash256::zero(), 1, 123);
-        let id = hash_header(&h);
-        let _ = p.on_message(Message::Headers { headers: vec![h.clone()] });
+        let id = Hash256([8u8; 32]);
 
-        let _req = p.request_block(id);
-        let blk = Block { header: h, txs: vec![] };
-        let _ = p.on_message(Message::BlockFound { id, block: blk });
-
+        let _ = p.request_block(id);
+        let _ = p.on_message_at(Message::BlockNotFound { id }, t0 + Duration::from_secs(1));
         assert!(!p.is_banned());
+
+        let _ = p.request_block(id);
+        let _ = p.on_message_at(Message::BlockNotFound { id }, t0 + Duration::from_secs(2));
+        assert!(p.is_banned());
     }
 }

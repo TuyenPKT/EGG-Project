@@ -68,7 +68,6 @@ struct FramedTcp {
 impl FramedTcp {
     fn new(stream: TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
-        // tick nhỏ để sync pipeline có thể "resend/abort" mà không treo chờ read quá lâu.
         stream.set_read_timeout(Some(IO_TICK_TIMEOUT))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {
@@ -250,7 +249,6 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
 
         if let Message::Headers { headers } = &msg {
             if headers.is_empty() {
-                // kết thúc header sync
                 let out = peer.on_message(msg.clone());
                 for m in out {
                     io.send(&m)?;
@@ -287,7 +285,6 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
     }
 
     // ---- Phase 2: pipeline download blocks ----
-    // build pending queue (dedupe) chỉ gồm id chưa có block
     let mut pending: VecDeque<egg_types::Hash256> = VecDeque::new();
     let mut seen: HashSet<egg_types::Hash256> = HashSet::new();
     for id in downloaded_ids.into_iter() {
@@ -305,8 +302,8 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
     last_progress = Instant::now();
 
     loop {
-        // fill window
         let now = Instant::now();
+
         while inflight.len() < BLOCK_WINDOW {
             let Some(id) = pending.pop_front() else { break };
 
@@ -367,7 +364,6 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
                         )));
                     };
 
-                    // node hardening: phải có header trước khi ingest
                     let has_h = egg_db::store::BlockStore::has_header(st.store(), id)
                         .map_err(|e| NodeError::Chain(e.to_string()))?;
                     if !has_h {
@@ -377,7 +373,6 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
                         )));
                     }
 
-                    // hardening: block.header phải hash ra đúng id
                     let hid = hash_header(&block.header);
                     if hid != id {
                         return Err(NodeError::Protocol(format!(
@@ -434,6 +429,15 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
                     return Err(NodeError::Protocol(format!(
                         "block {:?} timeout after {} retries",
                         id, MAX_BLOCK_RETRIES
+                    )));
+                }
+
+                // ghi nhận timeout/resend vào penalty score của peer
+                peer.note_timeout();
+                if peer.is_banned() {
+                    return Err(NodeError::Protocol(format!(
+                        "peer banned: {}",
+                        peer.ban_reason().unwrap_or("unknown")
                     )));
                 }
 
