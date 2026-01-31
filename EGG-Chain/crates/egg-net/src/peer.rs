@@ -44,7 +44,7 @@ pub struct PeerMachine {
     local: LocalInfo,
     remote: Option<RemoteInfo>,
 
-    // headers-first sync cursor (chỉ dùng cho syncer)
+    // headers-first sync cursor
     sync_enabled: bool,
     sync_cursor_start: Hash256,
     sync_batch_max: u32,
@@ -63,7 +63,6 @@ impl PeerMachine {
         }
     }
 
-    /// Bật chế độ “syncer” (sau handshake sẽ tự request headers).
     pub fn enable_header_sync(mut self, batch_max: u32) -> Self {
         self.sync_enabled = true;
         self.sync_batch_max = batch_max.max(1);
@@ -79,7 +78,6 @@ impl PeerMachine {
         self.remote.as_ref()
     }
 
-    /// Outbound start: gửi Hello.
     pub fn start(&mut self) -> Vec<Message> {
         if self.role == Role::Outbound && self.hs == HandshakeState::Init {
             self.hs = HandshakeState::SentHello;
@@ -101,7 +99,14 @@ impl PeerMachine {
         }
     }
 
-    fn mark_remote(&mut self, chain_id: u32, genesis_id: Hash256, tip: Tip, node_nonce: u64, agent: String) {
+    fn mark_remote(
+        &mut self,
+        chain_id: u32,
+        genesis_id: Hash256,
+        tip: Tip,
+        node_nonce: u64,
+        agent: String,
+    ) {
         self.remote = Some(RemoteInfo {
             chain_id,
             genesis_id,
@@ -119,16 +124,20 @@ impl PeerMachine {
         }
     }
 
-    /// Xử lý message inbound, trả list message outbound.
     pub fn on_message(&mut self, msg: Message) -> Vec<Message> {
         match msg {
-            Message::Hello { chain_id, genesis_id, tip, node_nonce, agent } => {
-                // Inbound side: nhận Hello -> reply HelloAck
+            Message::Hello {
+                chain_id,
+                genesis_id,
+                tip,
+                node_nonce,
+                agent,
+            } => {
                 self.mark_remote(chain_id, genesis_id, tip, node_nonce, agent);
 
                 match self.hs {
                     HandshakeState::Init => self.hs = HandshakeState::ReceivedHello,
-                    HandshakeState::SentHello => { /* both initiated */ }
+                    HandshakeState::SentHello => {}
                     _ => {}
                 }
 
@@ -140,43 +149,43 @@ impl PeerMachine {
                     agent: self.local.agent.clone(),
                 }];
 
-                // handshake complete for inbound on Hello (ack sent)
                 self.hs = HandshakeState::Ready;
                 out.extend(self.maybe_sync_kickoff());
                 out
             }
 
-            Message::HelloAck { chain_id, genesis_id, tip, node_nonce, agent } => {
-                // Outbound side: nhận HelloAck -> Ready
+            Message::HelloAck {
+                chain_id,
+                genesis_id,
+                tip,
+                node_nonce,
+                agent,
+            } => {
                 self.mark_remote(chain_id, genesis_id, tip, node_nonce, agent);
                 self.hs = HandshakeState::Ready;
                 self.maybe_sync_kickoff()
             }
 
-            Message::GetHeaders { start, max } => {
-                // PeerMachine không tự “có chain”; phần phục vụ headers nằm ở helper handle_get_headers().
-                // Tại đây chỉ pass-through để caller xử lý.
-                let _ = (start, max);
-                vec![]
-            }
+            Message::GetHeaders { start: _, max: _ } => vec![],
 
             Message::Headers { headers } => {
-                // Syncer: nhận headers, cập nhật cursor = hash(header cuối), request batch tiếp nếu còn.
                 if !self.sync_enabled {
                     return vec![];
                 }
 
                 if headers.is_empty() {
-                    return vec![]; // remote hết headers
+                    return vec![];
                 }
 
                 let last = headers.last().expect("non-empty");
                 let last_id = hash_header(last);
                 self.sync_cursor_start = last_id;
 
-                // request next batch
                 vec![self.make_get_headers(self.sync_cursor_start)]
             }
+
+            Message::GetBlock { id: _ } => vec![],
+            Message::Block { id: _, block: _ } => vec![],
 
             Message::Ping { nonce } => vec![Message::Pong { nonce }],
             Message::Pong { nonce: _ } => vec![],
@@ -184,12 +193,10 @@ impl PeerMachine {
     }
 }
 
-/// Provider để phục vụ GetHeaders (node/chainstate sẽ implement phía trên).
 pub trait HeaderProvider {
     fn get_headers_after(&self, start: Hash256, max: usize) -> Vec<BlockHeader>;
 }
 
-/// Helper: xử lý GetHeaders và trả Headers.
 pub fn handle_get_headers<P: HeaderProvider>(p: &P, start: Hash256, max: u32) -> Message {
     let list = p.get_headers_after(start, max as usize);
     Message::Headers { headers: list }
@@ -213,9 +220,7 @@ mod tests {
 
     #[derive(Clone)]
     struct MemProvider {
-        // canonical chain headers by height (0..)
         headers: Vec<BlockHeader>,
-        // hashes by height
         hashes: Vec<Hash256>,
     }
 
@@ -224,7 +229,6 @@ mod tests {
             let mut headers = Vec::with_capacity(len);
             let mut hashes = Vec::with_capacity(len);
 
-            // genesis
             let g_parent = Hash256::zero();
             let g = hdr(g_parent, 0, 1);
             let g_id = hash_header(&g);
@@ -245,7 +249,6 @@ mod tests {
 
     impl HeaderProvider for MemProvider {
         fn get_headers_after(&self, start: Hash256, max: usize) -> Vec<BlockHeader> {
-            // find start height by hash
             let mut start_h: Option<usize> = None;
             for (i, h) in self.hashes.iter().enumerate() {
                 if *h == start {
@@ -270,10 +273,15 @@ mod tests {
         let genesis_id = Hash256([9u8; 32]);
 
         let provider = MemProvider::new(5);
-        let local_tip = Tip { height: 0, hash: provider.hashes[0] };
-        let remote_tip = Tip { height: 4, hash: provider.hashes[4] };
+        let local_tip = Tip {
+            height: 0,
+            hash: provider.hashes[0],
+        };
+        let remote_tip = Tip {
+            height: 4,
+            hash: provider.hashes[4],
+        };
 
-        // syncer (outbound) local at genesis
         let mut a = PeerMachine::new(
             Role::Outbound,
             LocalInfo {
@@ -286,7 +294,6 @@ mod tests {
         )
         .enable_header_sync(2);
 
-        // responder (inbound) has longer chain
         let mut b = PeerMachine::new(
             Role::Inbound,
             LocalInfo {
@@ -298,15 +305,12 @@ mod tests {
             },
         );
 
-        // A start => Hello
         let m1 = a.start();
         assert_eq!(m1.len(), 1);
 
-        // B receives Hello => HelloAck
         let out_b = b.on_message(m1[0].clone());
-        assert!(out_b.iter().any(|m| matches!(m, Message::HelloAck{..})));
+        assert!(out_b.iter().any(|m| matches!(m, Message::HelloAck { .. })));
 
-        // A receives HelloAck => Ready + GetHeaders(start=genesis)
         let mut out_a = Vec::new();
         for m in out_b {
             out_a.extend(a.on_message(m));
@@ -314,19 +318,19 @@ mod tests {
         assert!(a.is_ready());
         assert!(out_a.iter().any(|m| matches!(m, Message::GetHeaders { .. })));
 
-        // B handles GetHeaders and replies Headers(batch=2)
         let mut reply_headers = Vec::new();
         for m in out_a {
             if let Message::GetHeaders { start, max } = m {
-                let resp = handle_get_headers(&provider, start, max);
+                let resp = super::handle_get_headers(&provider, start, max);
                 reply_headers.push(resp);
             }
         }
         assert_eq!(reply_headers.len(), 1);
-        let Message::Headers { headers } = &reply_headers[0] else { panic!("expected headers"); };
+        let Message::Headers { headers } = &reply_headers[0] else {
+            panic!("expected headers");
+        };
         assert_eq!(headers.len(), 2);
 
-        // A receives Headers => should request next batch with start = hash(last header)
         let out_a2 = a.on_message(reply_headers[0].clone());
         assert_eq!(out_a2.len(), 1);
         let Message::GetHeaders { start, max: _ } = out_a2[0] else {

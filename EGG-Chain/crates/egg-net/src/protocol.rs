@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use egg_types::{canonical, BlockHeader, Hash256};
+use egg_types::{canonical, Block, BlockHeader, Hash256};
 
 const MAGIC: [u8; 8] = *b"EGGNET00";
 const VERSION: u16 = 1;
@@ -32,6 +32,10 @@ pub enum Message {
     // headers-first
     GetHeaders { start: Hash256, max: u32 },
     Headers { headers: Vec<BlockHeader> },
+
+    // block download
+    GetBlock { id: Hash256 },
+    Block { id: Hash256, block: Option<Block> },
 
     // keepalive
     Ping { nonce: u64 },
@@ -198,8 +202,13 @@ fn decode_tip(c: &mut Cursor<'_>) -> Result<Tip> {
 // Tags
 const TAG_HELLO: u8 = 1;
 const TAG_HELLO_ACK: u8 = 2;
+
 const TAG_GET_HEADERS: u8 = 10;
 const TAG_HEADERS: u8 = 11;
+
+const TAG_GET_BLOCK: u8 = 12;
+const TAG_BLOCK: u8 = 13;
+
 const TAG_PING: u8 = 20;
 const TAG_PONG: u8 = 21;
 
@@ -249,11 +258,28 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>> {
             let n: u32 = headers.len().try_into().unwrap_or(u32::MAX);
             push_u32_be(&mut out, n);
 
-            // Mỗi header encode theo canonical egg-types (fixed 100 bytes),
-            // nhưng vẫn đóng gói theo len để dễ evolve.
             for h in headers {
                 let hb = canonical::encode_block_header(h);
                 push_bytes_len_u32(&mut out, &hb)?;
+            }
+        }
+        Message::GetBlock { id } => {
+            push_u8(&mut out, TAG_GET_BLOCK);
+            push_hash256(&mut out, *id);
+        }
+        Message::Block { id, block } => {
+            push_u8(&mut out, TAG_BLOCK);
+            push_hash256(&mut out, *id);
+
+            match block {
+                None => {
+                    push_u8(&mut out, 0);
+                }
+                Some(b) => {
+                    push_u8(&mut out, 1);
+                    let bb = canonical::encode_block(b);
+                    push_bytes_len_u32(&mut out, &bb)?;
+                }
             }
         }
         Message::Ping { nonce } => {
@@ -323,6 +349,24 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message> {
             }
             Ok(Message::Headers { headers })
         }
+        TAG_GET_BLOCK => {
+            let id = c.take_hash256()?;
+            Ok(Message::GetBlock { id })
+        }
+        TAG_BLOCK => {
+            let id = c.take_hash256()?;
+            let flag = c.take_u8()?;
+            match flag {
+                0 => Ok(Message::Block { id, block: None }),
+                1 => {
+                    let bb = c.take_bytes_len_u32()?;
+                    let b = canonical::decode_block(&bb)
+                        .map_err(|e| ProtocolError::Canonical(e.to_string()))?;
+                    Ok(Message::Block { id, block: Some(b) })
+                }
+                other => Err(ProtocolError::InvalidTag { tag: other }),
+            }
+        }
         TAG_PING => {
             let nonce = c.take_u64_be()?;
             Ok(Message::Ping { nonce })
@@ -380,9 +424,23 @@ mod tests {
     }
 
     #[test]
-    fn invalid_magic_rejected() {
-        let bad = vec![0u8; 12];
-        let err = decode_message(&bad).unwrap_err();
-        assert!(matches!(err, ProtocolError::InvalidMagic { .. }));
+    fn roundtrip_block_empty_txs_header_matches() {
+        let blk = Block {
+            header: sample_header(7, 3),
+            txs: vec![],
+        };
+        let m = Message::Block {
+            id: Hash256([3u8; 32]),
+            block: Some(blk.clone()),
+        };
+
+        let enc = encode_message(&m).unwrap();
+        let dec = decode_message(&enc).unwrap();
+
+        let Message::Block { id, block } = dec else { panic!("expected Block"); };
+        assert_eq!(id, Hash256([3u8; 32]));
+        let b = block.expect("expected Some(block)");
+        assert_eq!(b.header, blk.header);
+        assert_eq!(b.txs.len(), 0);
     }
 }

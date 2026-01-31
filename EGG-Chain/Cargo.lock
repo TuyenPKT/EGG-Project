@@ -144,13 +144,12 @@ dependencies = [
 
 [[package]]
 name = "egg-node"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "egg-chain",
  "egg-crypto",
  "egg-db",
  "egg-net",
- "egg-rpc",
  "egg-types",
 ]
 

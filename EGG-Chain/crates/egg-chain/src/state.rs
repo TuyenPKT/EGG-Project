@@ -51,6 +51,9 @@ pub enum ChainStateError {
 
     #[error("missing block meta for block {id:?}")]
     MissingBlockMeta { id: Hash256 },
+
+    #[error("block header does not match stored header for id {id:?}")]
+    HeaderMismatch { id: Hash256 },
 }
 
 pub type Result<T> = std::result::Result<T, ChainStateError>;
@@ -128,7 +131,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(self.store.get_block(id)?)
     }
 
-    /// Migration/index bootstrap: dựng bmeta/canon/children dọc theo tip hiện tại (không cần scan toàn DB).
     fn bootstrap_indexes_from_tip(&self, tip: ChainTip) -> Result<()> {
         let need_bmeta = self.store.get_block_meta(tip.hash)?.is_none();
         let need_canon = self.store.get_canon_hash(tip.height)?.is_none();
@@ -234,15 +236,11 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(self.store.get_canon_hash(height)?)
     }
 
-    /// Trả headers theo canonical chain (block đã có) bắt đầu “sau start_hash”.
-    /// - Nếu start_hash không nằm trên canonical chain => trả vec rỗng.
     pub fn get_headers_after(&self, start_hash: Hash256, max: usize) -> Result<Vec<BlockHeader>> {
         if max == 0 {
             return Ok(vec![]);
         }
 
-        // tìm height của start_hash bằng cách walk canon (O(tip_height), dùng cho skeleton).
-        // Vì đã có canon height->hash, cách ổn định: scan từ 0..=tip.height.
         let mut start_h: Option<u64> = None;
         for h in 0..=self.tip.height.0 {
             let hh = self.store.get_canon_hash(Height(h))?;
@@ -398,13 +396,57 @@ impl<S: ChainStore + Clone> ChainState<S> {
                     got: id,
                 });
             }
+            // genesis đã có khi open_or_init; nếu ai đó gửi lại genesis block thì coi như known
             return Ok((id, IngestOutcome::AlreadyKnown));
         }
 
+        // CASE: header đã có từ headers-first, nhưng block chưa có -> phải cho phép put_block + connect.
         if self.store.has_header(id)? {
-            return Ok((id, IngestOutcome::AlreadyKnown));
+            if self.store.has_block(id)? {
+                return Ok((id, IngestOutcome::AlreadyKnown));
+            }
+
+            let stored_hdr = self.store.get_header(id)?;
+            if stored_hdr != block.header {
+                return Err(ChainStateError::HeaderMismatch { id });
+            }
+
+            self.store.put_block(id, &block)?;
+            self.ensure_block_meta_from_header(id, &block.header)?;
+
+            // đảm bảo parent->children index
+            let p = block.header.parent;
+            let existing_children = self.store.get_children(p)?;
+            if !existing_children.iter().any(|x| *x == id) {
+                self.store.add_child(p, id)?;
+            }
+
+            if !self.store.has_header(p)? {
+                return Ok((id, IngestOutcome::StoredOrphan));
+            }
+
+            let parent_hdr = self.store.get_header(p)?;
+            let parent_meta = self.ensure_block_meta_from_header(p, &parent_hdr)?;
+            let expect_h = Height(parent_meta.height.0.saturating_add(1));
+            if block.header.height != expect_h {
+                return Err(ChainStateError::HeightNotParentPlusOne {
+                    parent_height: parent_meta.height,
+                    child_height: block.header.height,
+                });
+            }
+
+            let tip_changed_here = self.maybe_set_tip(id, block.header.height)?;
+            self.connect_descendants_from(id)?;
+
+            let outcome = if tip_changed_here {
+                IngestOutcome::NewTip
+            } else {
+                IngestOutcome::StoredConnected
+            };
+            return Ok((id, outcome));
         }
 
+        // CASE: header chưa có
         self.store.put_header(id, &block.header)?;
         self.store.put_block(id, &block)?;
         self.store.put_block_meta(
@@ -441,12 +483,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok((id, outcome))
     }
 
-    /// Ingest header (headers-first):
-    /// - verify pow
-    /// - store header + bmeta + add_child(parent, id)
-    /// - nếu parent chưa có => orphan
-    /// - nếu parent có => verify height = parent+1
-    /// Lưu ý: không yêu cầu block.
     pub fn ingest_header(&mut self, header: BlockHeader) -> Result<(Hash256, HeaderIngestOutcome)> {
         if !pow_valid(&header) {
             return Err(ChainStateError::InvalidPow);
@@ -454,7 +490,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
 
         let id = header_id(&header);
 
-        // height 0: chỉ chấp nhận đúng genesis
         if header.height == Height(0) {
             if id != self.meta.genesis_id {
                 return Err(ChainStateError::GenesisIdMismatch {
@@ -599,7 +634,7 @@ mod tests {
             timestamp_utc: 1_700_000_000,
             nonce,
             merkle_root,
-            pow_difficulty_bits: 0, // always valid
+            pow_difficulty_bits: 0,
         };
         Block { header, txs: vec![] }
     }
@@ -751,5 +786,37 @@ mod tests {
 
         let hs3 = st.get_headers_after(Hash256([9u8; 32]), 10).unwrap();
         assert!(hs3.is_empty());
+    }
+
+    #[test]
+    fn ingest_block_when_header_preexists_puts_block_and_connects() {
+        let kv = MemKv::new();
+        let store = DbChainStore::new(kv);
+        let spec = mk_spec(1_700_000_000);
+        let mut st = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
+
+        let g = st.tip.hash;
+
+        // ingest header trước
+        let h1 = BlockHeader {
+            parent: g,
+            height: Height(1),
+            timestamp_utc: 1_700_000_000,
+            nonce: 9,
+            merkle_root: Hash256::zero(),
+            pow_difficulty_bits: 0,
+        };
+        let h1id = header_id(&h1);
+        st.ingest_header(h1.clone()).unwrap();
+        assert!(store.has_header(h1id).unwrap());
+        assert!(!store.has_block(h1id).unwrap());
+
+        // giờ ingest block cùng header
+        let b1 = Block { header: h1, txs: vec![] };
+        let (_id, out) = st.ingest_block(b1).unwrap();
+        assert!(store.has_block(h1id).unwrap());
+        assert!(matches!(out, IngestOutcome::NewTip | IngestOutcome::StoredConnected));
+        assert_eq!(st.tip.height, Height(1));
+        assert_eq!(st.tip.hash, h1id);
     }
 }
