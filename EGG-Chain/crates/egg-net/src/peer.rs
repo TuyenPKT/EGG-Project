@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
+
 use egg_crypto::hash_header;
 use egg_types::{BlockHeader, Hash256};
 
@@ -48,10 +50,18 @@ pub struct PeerMachine {
     sync_enabled: bool,
     sync_cursor_start: Hash256,
     sync_batch_max: u32,
+
+    // hardening
+    banned: Option<String>,
+    known_header_ids: HashSet<Hash256>,
+    inflight_blocks: HashSet<Hash256>,
 }
 
 impl PeerMachine {
     pub fn new(role: Role, local: LocalInfo) -> Self {
+        let mut known = HashSet::new();
+        known.insert(local.tip.hash);
+
         Self {
             role,
             hs: HandshakeState::Init,
@@ -60,6 +70,9 @@ impl PeerMachine {
             sync_batch_max: 2000,
             local,
             remote: None,
+            banned: None,
+            known_header_ids: known,
+            inflight_blocks: HashSet::new(),
         }
     }
 
@@ -78,7 +91,25 @@ impl PeerMachine {
         self.remote.as_ref()
     }
 
+    pub fn is_banned(&self) -> bool {
+        self.banned.is_some()
+    }
+
+    pub fn ban_reason(&self) -> Option<&str> {
+        self.banned.as_deref()
+    }
+
+    fn ban(&mut self, reason: impl Into<String>) {
+        if self.banned.is_none() {
+            self.banned = Some(reason.into());
+        }
+    }
+
     pub fn start(&mut self) -> Vec<Message> {
+        if self.is_banned() {
+            return vec![];
+        }
+
         if self.role == Role::Outbound && self.hs == HandshakeState::Init {
             self.hs = HandshakeState::SentHello;
             return vec![Message::Hello {
@@ -97,6 +128,11 @@ impl PeerMachine {
             start,
             max: self.sync_batch_max,
         }
+    }
+
+    pub fn request_block(&mut self, id: Hash256) -> Message {
+        self.inflight_blocks.insert(id);
+        Message::GetBlock { id }
     }
 
     fn mark_remote(
@@ -125,6 +161,10 @@ impl PeerMachine {
     }
 
     pub fn on_message(&mut self, msg: Message) -> Vec<Message> {
+        if self.is_banned() {
+            return vec![];
+        }
+
         match msg {
             Message::Hello {
                 chain_id,
@@ -169,6 +209,12 @@ impl PeerMachine {
             Message::GetHeaders { start: _, max: _ } => vec![],
 
             Message::Headers { headers } => {
+                // luôn ghi nhận known headers (hardening), dù sync_enabled hay không
+                for h in headers.iter() {
+                    let id = hash_header(h);
+                    self.known_header_ids.insert(id);
+                }
+
                 if !self.sync_enabled {
                     return vec![];
                 }
@@ -185,7 +231,22 @@ impl PeerMachine {
             }
 
             Message::GetBlock { id: _ } => vec![],
-            Message::Block { id: _, block: _ } => vec![],
+
+            Message::Block { id, block: _ } => {
+                // 1) unsolicited block -> ban
+                if !self.inflight_blocks.remove(&id) {
+                    self.ban(format!("unsolicited block {:?}", id));
+                    return vec![];
+                }
+
+                // 2) block nhưng chưa biết header id -> ban
+                if !self.known_header_ids.contains(&id) {
+                    self.ban(format!("block without known header {:?}", id));
+                    return vec![];
+                }
+
+                vec![]
+            }
 
             Message::Ping { nonce } => vec![Message::Pong { nonce }],
             Message::Pong { nonce: _ } => vec![],
@@ -218,127 +279,75 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct MemProvider {
-        headers: Vec<BlockHeader>,
-        hashes: Vec<Hash256>,
-    }
-
-    impl MemProvider {
-        fn new(len: usize) -> Self {
-            let mut headers = Vec::with_capacity(len);
-            let mut hashes = Vec::with_capacity(len);
-
-            let g_parent = Hash256::zero();
-            let g = hdr(g_parent, 0, 1);
-            let g_id = hash_header(&g);
-            headers.push(g);
-            hashes.push(g_id);
-
-            for h in 1..len {
-                let parent = hashes[h - 1];
-                let x = hdr(parent, h as u64, h as u64);
-                let xid = hash_header(&x);
-                headers.push(x);
-                hashes.push(xid);
-            }
-
-            Self { headers, hashes }
+    fn mk_local() -> LocalInfo {
+        let tip = Tip {
+            height: 0,
+            hash: Hash256::zero(),
+        };
+        LocalInfo {
+            chain_id: 1,
+            genesis_id: Hash256([9u8; 32]),
+            tip,
+            node_nonce: 111,
+            agent: "local".to_string(),
         }
     }
 
-    impl HeaderProvider for MemProvider {
-        fn get_headers_after(&self, start: Hash256, max: usize) -> Vec<BlockHeader> {
-            let mut start_h: Option<usize> = None;
-            for (i, h) in self.hashes.iter().enumerate() {
-                if *h == start {
-                    start_h = Some(i);
-                    break;
-                }
-            }
-            let Some(sh) = start_h else { return vec![]; };
-            let mut out = Vec::new();
-            let mut i = sh + 1;
-            while i < self.headers.len() && out.len() < max {
-                out.push(self.headers[i].clone());
-                i += 1;
-            }
-            out
+    fn mk_ack() -> Message {
+        Message::HelloAck {
+            chain_id: 1,
+            genesis_id: Hash256([9u8; 32]),
+            tip: Tip {
+                height: 0,
+                hash: Hash256::zero(),
+            },
+            node_nonce: 222,
+            agent: "remote".to_string(),
         }
     }
 
     #[test]
-    fn handshake_then_headers_sync_requests_next_batch() {
-        let chain_id = 1;
-        let genesis_id = Hash256([9u8; 32]);
+    fn ban_on_unsolicited_block() {
+        let mut p = PeerMachine::new(Role::Outbound, mk_local());
+        let _ = p.on_message(mk_ack());
+        assert!(p.is_ready());
 
-        let provider = MemProvider::new(5);
-        let local_tip = Tip {
-            height: 0,
-            hash: provider.hashes[0],
-        };
-        let remote_tip = Tip {
-            height: 4,
-            hash: provider.hashes[4],
-        };
+        let id = Hash256([7u8; 32]);
+        let _ = p.on_message(Message::Block { id, block: None });
 
-        let mut a = PeerMachine::new(
-            Role::Outbound,
-            LocalInfo {
-                chain_id,
-                genesis_id,
-                tip: local_tip,
-                node_nonce: 111,
-                agent: "a".to_string(),
-            },
-        )
-        .enable_header_sync(2);
+        assert!(p.is_banned());
+        assert!(p.ban_reason().unwrap().contains("unsolicited"));
+    }
 
-        let mut b = PeerMachine::new(
-            Role::Inbound,
-            LocalInfo {
-                chain_id,
-                genesis_id,
-                tip: remote_tip,
-                node_nonce: 222,
-                agent: "b".to_string(),
-            },
-        );
+    #[test]
+    fn ban_on_block_without_known_header_even_if_requested() {
+        let mut p = PeerMachine::new(Role::Outbound, mk_local());
+        let _ = p.on_message(mk_ack());
+        assert!(p.is_ready());
 
-        let m1 = a.start();
-        assert_eq!(m1.len(), 1);
+        let id = Hash256([8u8; 32]);
+        let _req = p.request_block(id);
 
-        let out_b = b.on_message(m1[0].clone());
-        assert!(out_b.iter().any(|m| matches!(m, Message::HelloAck { .. })));
+        let _ = p.on_message(Message::Block { id, block: None });
 
-        let mut out_a = Vec::new();
-        for m in out_b {
-            out_a.extend(a.on_message(m));
-        }
-        assert!(a.is_ready());
-        assert!(out_a.iter().any(|m| matches!(m, Message::GetHeaders { .. })));
+        assert!(p.is_banned());
+        assert!(p.ban_reason().unwrap().contains("without known header"));
+    }
 
-        let mut reply_headers = Vec::new();
-        for m in out_a {
-            if let Message::GetHeaders { start, max } = m {
-                let resp = super::handle_get_headers(&provider, start, max);
-                reply_headers.push(resp);
-            }
-        }
-        assert_eq!(reply_headers.len(), 1);
-        let Message::Headers { headers } = &reply_headers[0] else {
-            panic!("expected headers");
-        };
-        assert_eq!(headers.len(), 2);
+    #[test]
+    fn accept_block_when_requested_and_header_known() {
+        let mut p = PeerMachine::new(Role::Outbound, mk_local());
+        let _ = p.on_message(mk_ack());
+        assert!(p.is_ready());
 
-        let out_a2 = a.on_message(reply_headers[0].clone());
-        assert_eq!(out_a2.len(), 1);
-        let Message::GetHeaders { start, max: _ } = out_a2[0] else {
-            panic!("expected GetHeaders");
-        };
+        // đưa 1 header vào known set qua Message::Headers
+        let h = hdr(Hash256::zero(), 1, 123);
+        let id = hash_header(&h);
+        let _ = p.on_message(Message::Headers { headers: vec![h] });
 
-        let last = headers.last().unwrap();
-        let expected_start = hash_header(last);
-        assert_eq!(start, expected_start);
+        let _req = p.request_block(id);
+        let _ = p.on_message(Message::Block { id, block: None });
+
+        assert!(!p.is_banned());
     }
 }

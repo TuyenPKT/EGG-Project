@@ -146,6 +146,13 @@ pub fn run_responder_once<S: ChainStore + Clone>(
             io.send(&m)?;
         }
 
+        if peer.is_banned() {
+            return Err(NodeError::Protocol(format!(
+                "peer banned: {}",
+                peer.ban_reason().unwrap_or("unknown")
+            )));
+        }
+
         if peer.is_ready() {
             match msg {
                 Message::GetHeaders { start, max } => {
@@ -153,21 +160,14 @@ pub fn run_responder_once<S: ChainStore + Clone>(
                     io.send(&resp)?;
                 }
                 Message::GetBlock { id } => {
-                    let have = st
-                        .store()
-                        .has_block(id)
+                    let have = egg_db::store::BlockStore::has_block(st.store(), id)
                         .map_err(|e| NodeError::Chain(e.to_string()))?;
                     if !have {
                         io.send(&Message::Block { id, block: None })?;
                     } else {
-                        let blk = st
-                            .store()
-                            .get_block(id)
+                        let blk = egg_db::store::BlockStore::get_block(st.store(), id)
                             .map_err(|e| NodeError::Chain(e.to_string()))?;
-                        io.send(&Message::Block {
-                            id,
-                            block: Some(blk),
-                        })?;
+                        io.send(&Message::Block { id, block: Some(blk) })?;
                     }
                 }
                 _ => {}
@@ -215,9 +215,6 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
         let msg = io.recv()?;
 
         if let Message::Headers { headers } = &msg {
-            if headers.is_empty() {
-                break;
-            }
             for h in headers.iter().cloned() {
                 let id = hash_header(&h);
                 downloaded_ids.push(id);
@@ -225,26 +222,49 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
             }
         }
 
-        let out = peer.on_message(msg);
+        let out = peer.on_message(msg.clone());
         for m in out {
             io.send(&m)?;
         }
+
+        if peer.is_banned() {
+            return Err(NodeError::Protocol(format!(
+                "peer banned: {}",
+                peer.ban_reason().unwrap_or("unknown")
+            )));
+        }
+
+        if matches!(msg, Message::Headers { headers } if headers.is_empty()) {
+            break;
+        }
     }
 
-    // Phase 2: download blocks
+    // Phase 2: download blocks (hardening: chỉ nhận Block nếu header đã có)
     for id in downloaded_ids.into_iter() {
-        let have = st
-            .store()
-            .has_block(id)
+        let have = egg_db::store::BlockStore::has_block(st.store(), id)
             .map_err(|e| NodeError::Chain(e.to_string()))?;
         if have {
             continue;
         }
 
-        io.send(&Message::GetBlock { id })?;
+        let req = peer.request_block(id);
+        io.send(&req)?;
 
         loop {
             let msg = io.recv()?;
+
+            let out = peer.on_message(msg.clone());
+            for m in out {
+                io.send(&m)?;
+            }
+
+            if peer.is_banned() {
+                return Err(NodeError::Protocol(format!(
+                    "peer banned: {}",
+                    peer.ban_reason().unwrap_or("unknown")
+                )));
+            }
+
             match msg {
                 Message::Block { id: rid, block } => {
                     if rid != id {
@@ -253,18 +273,24 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
                             id, rid
                         )));
                     }
+
+                    let has_h = egg_db::store::BlockStore::has_header(st.store(), rid)
+                        .map_err(|e| NodeError::Chain(e.to_string()))?;
+                    if !has_h {
+                        return Err(NodeError::Protocol(format!(
+                            "received block {:?} but local missing header",
+                            rid
+                        )));
+                    }
+
                     let Some(b) = block else {
                         return Err(NodeError::Protocol(format!("block not found for {:?}", id)));
                     };
+
                     let _ = st.ingest_block(b).map_err(|e| NodeError::Chain(e.to_string()))?;
                     break;
                 }
-                other => {
-                    let out = peer.on_message(other);
-                    for m in out {
-                        io.send(&m)?;
-                    }
-                }
+                _ => {}
             }
         }
     }
@@ -282,7 +308,7 @@ mod tests {
     use std::thread;
 
     use egg_crypto::merkle::merkle_root_txids;
-    use egg_db::store::{BlockStore, DbChainStore};
+    use egg_db::store::DbChainStore;
     use egg_db::MemKv;
     use egg_types::{Block, BlockHeader, ChainParams, ChainSpec, GenesisSpec, Hash256, Height};
 
@@ -314,11 +340,7 @@ mod tests {
         Block { header, txs: vec![] }
     }
 
-    fn build_chain_with_blocks(
-        store: DbChainStore<MemKv>,
-        spec: ChainSpec,
-        n_blocks: u64,
-    ) -> Vec<Hash256> {
+    fn build_chain_with_blocks(store: DbChainStore<MemKv>, spec: ChainSpec, n_blocks: u64) -> Vec<Hash256> {
         let mut st = ChainState::open_or_init(store.clone(), spec).unwrap();
         let mut hashes = Vec::new();
 
@@ -369,10 +391,10 @@ mod tests {
         t_responder.join().unwrap();
 
         for (h, id) in expected_hashes.iter().enumerate() {
-            let has_h = syncer_store.has_header(*id).unwrap();
+            let has_h = egg_db::store::BlockStore::has_header(&syncer_store, *id).unwrap();
             assert!(has_h, "missing header at height {} id={:?}", h, id);
 
-            let has_b = syncer_store.has_block(*id).unwrap();
+            let has_b = egg_db::store::BlockStore::has_block(&syncer_store, *id).unwrap();
             assert!(has_b, "missing block at height {} id={:?}", h, id);
         }
     }
