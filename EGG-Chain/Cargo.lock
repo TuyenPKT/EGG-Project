@@ -155,9 +155,8 @@ dependencies = [
 
 [[package]]
 name = "egg-rpc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
- "egg-types",
  "serde",
  "serde_json",
 ]

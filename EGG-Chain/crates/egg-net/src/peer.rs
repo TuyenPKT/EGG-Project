@@ -141,6 +141,15 @@ impl PeerMachine {
         self.penalty_score
     }
 
+    // --- telemetry getters (BƯỚC 29) ---
+    pub fn distinct_notfound_count(&self) -> usize {
+        self.notfound_distinct_ids.len()
+    }
+
+    pub fn inflight_blocks_count(&self) -> usize {
+        self.inflight_blocks.len()
+    }
+
     fn ban(&mut self, reason: impl Into<String>) {
         if self.banned.is_none() {
             self.banned = Some(reason.into());
@@ -267,7 +276,7 @@ impl PeerMachine {
         // base penalty
         self.add_penalty(now, PENALTY_BLOCK_NOTFOUND, "BlockNotFound");
 
-        // IMPORTANT: không giữ mutable borrow từ entry() qua các lần gọi self.add_penalty(...)
+        // không giữ mutable borrow từ entry() qua các lần gọi self.add_penalty(...)
         let count: u8 = {
             let e = self.notfound_by_id.entry(id).or_insert(0);
             *e = e.saturating_add(1);
@@ -288,7 +297,6 @@ impl PeerMachine {
             let prev = self.notfound_distinct_ids.len();
             self.notfound_distinct_ids.insert(id);
 
-            // vượt ngưỡng distinct -> cộng penalty mạnh (ban chỉ khi vượt threshold)
             if prev <= MAX_DISTINCT_NOTFOUND_IDS
                 && self.notfound_distinct_ids.len() > MAX_DISTINCT_NOTFOUND_IDS
             {
@@ -389,7 +397,6 @@ impl PeerMachine {
                     return vec![];
                 }
 
-                // invalid: id mismatch
                 let hid = hash_header(&block.header);
                 if hid != id {
                     self.add_penalty(now, PENALTY_BLOCK_ID_MISMATCH, "BlockFound id mismatch");
