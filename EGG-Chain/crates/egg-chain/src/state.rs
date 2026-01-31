@@ -63,6 +63,13 @@ pub enum IngestOutcome {
     NewTip,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderIngestOutcome {
+    AlreadyKnown,
+    StoredOrphan,
+    StoredConnected,
+}
+
 #[derive(Clone)]
 pub struct ChainState<S: ChainStore + Clone> {
     pub spec: ChainSpec,
@@ -123,7 +130,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
 
     /// Migration/index bootstrap: dựng bmeta/canon/children dọc theo tip hiện tại (không cần scan toàn DB).
     fn bootstrap_indexes_from_tip(&self, tip: ChainTip) -> Result<()> {
-        // Nếu tip không có bmeta hoặc canon, bootstrap theo chain-walk
         let need_bmeta = self.store.get_block_meta(tip.hash)?.is_none();
         let need_canon = self.store.get_canon_hash(tip.height)?.is_none();
 
@@ -148,9 +154,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(())
     }
 
-    /// Mở chainstate từ store.
-    /// - Nếu chưa có tip: init genesis + tip + meta + index genesis
-    /// - Nếu đã có tip: meta bắt buộc và khớp spec; bootstrap index nếu thiếu
     pub fn open_or_init(store: S, spec: ChainSpec) -> Result<Self> {
         validate_chainspec(&spec)?;
         let expected = Self::expected_meta(&spec)?;
@@ -162,7 +165,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
                     return Err(ChainStateError::MetaMismatch { expected, got });
                 }
 
-                // bootstrap/migrate indexes nếu DB cũ chưa có
                 let st = Self {
                     spec,
                     tip,
@@ -173,7 +175,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
                 Ok(st)
             }
             None => {
-                // Init genesis
                 let hdr = genesis_header(&spec)?;
                 let gid = expected.genesis_id;
 
@@ -194,7 +195,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
                 store.put_header(gid, &hdr)?;
                 store.put_block(gid, &blk)?;
 
-                // index genesis
                 store.put_block_meta(
                     gid,
                     BlockMeta {
@@ -234,8 +234,42 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(self.store.get_canon_hash(height)?)
     }
 
+    /// Trả headers theo canonical chain (block đã có) bắt đầu “sau start_hash”.
+    /// - Nếu start_hash không nằm trên canonical chain => trả vec rỗng.
+    pub fn get_headers_after(&self, start_hash: Hash256, max: usize) -> Result<Vec<BlockHeader>> {
+        if max == 0 {
+            return Ok(vec![]);
+        }
+
+        // tìm height của start_hash bằng cách walk canon (O(tip_height), dùng cho skeleton).
+        // Vì đã có canon height->hash, cách ổn định: scan từ 0..=tip.height.
+        let mut start_h: Option<u64> = None;
+        for h in 0..=self.tip.height.0 {
+            let hh = self.store.get_canon_hash(Height(h))?;
+            if let Some(x) = hh {
+                if x == start_hash {
+                    start_h = Some(h);
+                    break;
+                }
+            }
+        }
+        let Some(sh) = start_h else {
+            return Ok(vec![]);
+        };
+
+        let mut out = Vec::new();
+        let mut cur_h = sh.saturating_add(1);
+        while cur_h <= self.tip.height.0 && out.len() < max {
+            let Some(hh) = self.store.get_canon_hash(Height(cur_h))? else { break; };
+            let hdr = self.store.get_header(hh)?;
+            out.push(hdr);
+            cur_h = cur_h.saturating_add(1);
+        }
+
+        Ok(out)
+    }
+
     fn reorg_canonical(&self, old_tip: ChainTip, new_tip: ChainTip) -> Result<()> {
-        // Tìm common ancestor, rồi set canon mapping theo new chain từ fork+1..new_tip.height
         let mut a = new_tip.hash;
         let mut ha = new_tip.height.0;
         let mut b = old_tip.hash;
@@ -261,7 +295,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
         }
         let ancestor_height = Height(ha);
 
-        // collect new path from new_tip down to ancestor (exclude ancestor)
         let mut path: Vec<(Height, Hash256)> = Vec::new();
         let mut cur = new_tip.hash;
         loop {
@@ -308,7 +341,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
     }
 
     fn try_connect_child(&mut self, parent: Hash256, child: Hash256) -> Result<bool> {
-        // child phải có header + block (đã lưu), verify quan hệ height
         if !self.store.has_header(child)? || !self.store.has_block(child)? {
             return Ok(false);
         }
@@ -318,11 +350,8 @@ impl<S: ChainStore + Clone> ChainState<S> {
             return Ok(false);
         }
 
-        // ensure bmeta parent tồn tại
         let parent_hdr = self.store.get_header(parent)?;
         let parent_meta = self.ensure_block_meta_from_header(parent, &parent_hdr)?;
-
-        // ensure bmeta child tồn tại
         let child_meta = self.ensure_block_meta_from_header(child, &child_hdr)?;
 
         let expect_h = Height(parent_meta.height.0.saturating_add(1));
@@ -333,7 +362,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
             });
         }
 
-        // connected: fork-choice update tip
         let _ = self.maybe_set_tip(child, child_meta.height)?;
         Ok(true)
     }
@@ -354,23 +382,15 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(())
     }
 
-    /// Ingest block bất kỳ (fork/orphan):
-    /// - verify merkle+txid, verify pow
-    /// - persist header+block+bmeta + add_child(parent, me)
-    /// - nếu parent đã có => verify height=parent+1, nối orphan subtree, update tip theo fork-choice
-    /// - nếu parent chưa có => stored orphan
     pub fn ingest_block(&mut self, block: Block) -> Result<(Hash256, IngestOutcome)> {
-        // txid + merkle
         crate::block_builder::verify_block_merkle(&block)?;
 
-        // pow
         if !pow_valid(&block.header) {
             return Err(ChainStateError::InvalidPow);
         }
 
         let id = header_id(&block.header);
 
-        // genesis rules (height 0 phải đúng genesis_id)
         if block.header.height == Height(0) {
             if id != self.meta.genesis_id {
                 return Err(ChainStateError::GenesisIdMismatch {
@@ -378,16 +398,13 @@ impl<S: ChainStore + Clone> ChainState<S> {
                     got: id,
                 });
             }
-            // genesis đã tồn tại: coi như known
             return Ok((id, IngestOutcome::AlreadyKnown));
         }
 
-        // already known
         if self.store.has_header(id)? {
             return Ok((id, IngestOutcome::AlreadyKnown));
         }
 
-        // persist
         self.store.put_header(id, &block.header)?;
         self.store.put_block(id, &block)?;
         self.store.put_block_meta(
@@ -399,12 +416,10 @@ impl<S: ChainStore + Clone> ChainState<S> {
         )?;
         self.store.add_child(block.header.parent, id)?;
 
-        // orphan?
         if !self.store.has_header(block.header.parent)? {
             return Ok((id, IngestOutcome::StoredOrphan));
         }
 
-        // parent exists => validate height relation
         let parent_hdr = self.store.get_header(block.header.parent)?;
         let parent_meta = self.ensure_block_meta_from_header(block.header.parent, &parent_hdr)?;
         let expect_h = Height(parent_meta.height.0.saturating_add(1));
@@ -415,7 +430,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
             });
         }
 
-        // connected => maybe update tip, then connect any descendants waiting on this block
         let tip_changed_here = self.maybe_set_tip(id, block.header.height)?;
         self.connect_descendants_from(id)?;
 
@@ -427,11 +441,61 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok((id, outcome))
     }
 
-    /// Validate best chain từ tip về genesis (basic):
-    /// - header+block+bmeta tồn tại
-    /// - pow ok
-    /// - merkle ok
-    /// - parent link hợp lệ đến genesis
+    /// Ingest header (headers-first):
+    /// - verify pow
+    /// - store header + bmeta + add_child(parent, id)
+    /// - nếu parent chưa có => orphan
+    /// - nếu parent có => verify height = parent+1
+    /// Lưu ý: không yêu cầu block.
+    pub fn ingest_header(&mut self, header: BlockHeader) -> Result<(Hash256, HeaderIngestOutcome)> {
+        if !pow_valid(&header) {
+            return Err(ChainStateError::InvalidPow);
+        }
+
+        let id = header_id(&header);
+
+        // height 0: chỉ chấp nhận đúng genesis
+        if header.height == Height(0) {
+            if id != self.meta.genesis_id {
+                return Err(ChainStateError::GenesisIdMismatch {
+                    expected: self.meta.genesis_id,
+                    got: id,
+                });
+            }
+            return Ok((id, HeaderIngestOutcome::AlreadyKnown));
+        }
+
+        if self.store.has_header(id)? {
+            return Ok((id, HeaderIngestOutcome::AlreadyKnown));
+        }
+
+        self.store.put_header(id, &header)?;
+        self.store.put_block_meta(
+            id,
+            BlockMeta {
+                parent: header.parent,
+                height: header.height,
+            },
+        )?;
+        self.store.add_child(header.parent, id)?;
+
+        if !self.store.has_header(header.parent)? {
+            return Ok((id, HeaderIngestOutcome::StoredOrphan));
+        }
+
+        let ph = self.store.get_header(header.parent)?;
+        let pm = self.ensure_block_meta_from_header(header.parent, &ph)?;
+        let expect_h = Height(pm.height.0.saturating_add(1));
+        if header.height != expect_h {
+            return Err(ChainStateError::HeightNotParentPlusOne {
+                parent_height: pm.height,
+                child_height: header.height,
+            });
+        }
+
+        Ok((id, HeaderIngestOutcome::StoredConnected))
+    }
+
     pub fn validate_best_chain(&self) -> Result<()> {
         let mut cur = self.tip.hash;
 
@@ -451,7 +515,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
                 return Err(ChainStateError::InvalidPow);
             }
 
-            // merkle + txid
             let blk = self.store.get_block(cur)?;
             crate::block_builder::verify_block_merkle(&blk)?;
 
@@ -465,7 +528,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
                 break;
             }
 
-            // parent must exist and height relation ok
             let p = hdr.parent;
             let ph = self.must_header(p)?;
             let pm = self.ensure_block_meta_from_header(p, &ph)?;
@@ -483,7 +545,6 @@ impl<S: ChainStore + Clone> ChainState<S> {
         Ok(())
     }
 
-    /// Mine 1 block từ mempool và ingest (local extends tip).
     pub fn mine_and_append_one(
         &mut self,
         mempool: &mut crate::mempool::Mempool,
@@ -510,6 +571,7 @@ impl<S: ChainStore + Clone> ChainState<S> {
 mod tests {
     use super::*;
     use egg_crypto::merkle::merkle_root_txids;
+    use egg_db::store::BlockStore;
     use egg_db::store::DbChainStore;
     use egg_db::MemKv;
     use egg_types::{ChainParams, GenesisSpec};
@@ -579,7 +641,6 @@ mod tests {
         let mut st = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
         let g = st.tip.hash;
 
-        // Chain A: g -> a1 -> a2
         let a1 = mk_empty_block(g, Height(1), 11);
         let a1id = header_id(&a1.header);
         st.ingest_block(a1).unwrap();
@@ -591,7 +652,6 @@ mod tests {
         assert_eq!(st.tip.height, Height(2));
         assert_eq!(st.tip.hash, a2id);
 
-        // Chain B out-of-order: ingest b2 (orphan) first
         let b1 = mk_empty_block(g, Height(1), 21);
         let b1id = header_id(&b1.header);
 
@@ -602,11 +662,9 @@ mod tests {
         assert_eq!(id_b2, b2id);
         assert_eq!(out_b2, IngestOutcome::StoredOrphan);
 
-        // Now ingest b1: should connect b1 and also connect b2 via children index
         let (id_b1, _out_b1) = st.ingest_block(b1).unwrap();
         assert_eq!(id_b1, b1id);
 
-        // Extend B to be longer: b3
         let b3 = mk_empty_block(b2id, Height(3), 23);
         let b3id = header_id(&b3.header);
         let _ = st.ingest_block(b3).unwrap();
@@ -614,11 +672,84 @@ mod tests {
         assert_eq!(st.tip.height, Height(3));
         assert_eq!(st.tip.hash, b3id);
 
-        // canonical should now follow chain B
         assert_eq!(st.canon_hash(Height(1)).unwrap(), Some(b1id));
         assert_eq!(st.canon_hash(Height(2)).unwrap(), Some(b2id));
         assert_eq!(st.canon_hash(Height(3)).unwrap(), Some(b3id));
 
         st.validate_best_chain().unwrap();
+    }
+
+    #[test]
+    fn ingest_header_stores_orphan_then_parent_connects() {
+        let kv = MemKv::new();
+        let store = DbChainStore::new(kv);
+        let spec = mk_spec(1_700_000_000);
+        let mut st = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
+        let g = st.tip.hash;
+
+        let h1 = BlockHeader {
+            parent: g,
+            height: Height(1),
+            timestamp_utc: 1_700_000_000,
+            nonce: 100,
+            merkle_root: Hash256::zero(),
+            pow_difficulty_bits: 0,
+        };
+        let h1id = header_id(&h1);
+
+        let h2 = BlockHeader {
+            parent: h1id,
+            height: Height(2),
+            timestamp_utc: 1_700_000_000,
+            nonce: 101,
+            merkle_root: Hash256::zero(),
+            pow_difficulty_bits: 0,
+        };
+        let h2id = header_id(&h2);
+
+        let (id2, o2) = st.ingest_header(h2).unwrap();
+        assert_eq!(id2, h2id);
+        assert_eq!(o2, HeaderIngestOutcome::StoredOrphan);
+        assert!(store.has_header(h2id).unwrap());
+
+        let (id1, o1) = st.ingest_header(h1).unwrap();
+        assert_eq!(id1, h1id);
+        assert_eq!(o1, HeaderIngestOutcome::StoredConnected);
+        assert!(store.has_header(h1id).unwrap());
+
+        assert!(store.get_block_meta(h1id).unwrap().is_some());
+        assert!(store.get_block_meta(h2id).unwrap().is_some());
+
+        let ch = store.get_children(h1id).unwrap();
+        assert!(ch.iter().any(|x| *x == h2id));
+    }
+
+    #[test]
+    fn get_headers_after_returns_canonical_sequence() {
+        let kv = MemKv::new();
+        let store = DbChainStore::new(kv);
+        let spec = mk_spec(1_700_000_000);
+        let mut st = ChainState::open_or_init(store.clone(), spec.clone()).unwrap();
+
+        let g = st.tip.hash;
+        let b1 = mk_empty_block(g, Height(1), 1);
+        let b1id = header_id(&b1.header);
+        st.ingest_block(b1).unwrap();
+
+        let b2 = mk_empty_block(b1id, Height(2), 2);
+        let _b2id = header_id(&b2.header);
+        st.ingest_block(b2).unwrap();
+
+        let hs = st.get_headers_after(g, 10).unwrap();
+        assert_eq!(hs.len(), 2);
+        assert_eq!(hs[0].height, Height(1));
+        assert_eq!(hs[1].height, Height(2));
+
+        let hs2 = st.get_headers_after(b1id, 10).unwrap();
+        assert_eq!(hs2.len(), 1);
+        assert_eq!(hs2[0].height, Height(2));
+
+        let hs3 = st.get_headers_after(Hash256([9u8; 32]), 10).unwrap();
+        assert!(hs3.is_empty());
     }
 }
