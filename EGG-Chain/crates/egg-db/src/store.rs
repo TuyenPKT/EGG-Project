@@ -22,6 +22,13 @@ pub struct ChainTip {
     pub hash: Hash256,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainMeta {
+    pub chain_id: u32,
+    pub genesis_id: Hash256,
+    pub chainspec_hash: Hash256,
+}
+
 pub trait BlockStore {
     fn put_header(&self, id: Hash256, header: &BlockHeader) -> Result<()>;
     fn get_header(&self, id: Hash256) -> Result<BlockHeader>;
@@ -35,6 +42,9 @@ pub trait BlockStore {
 pub trait ChainStore: BlockStore {
     fn set_tip(&self, tip: ChainTip) -> Result<()>;
     fn get_tip(&self) -> Result<Option<ChainTip>>;
+
+    fn set_meta(&self, meta: ChainMeta) -> Result<()>;
+    fn get_meta(&self) -> Result<Option<ChainMeta>>;
 }
 
 #[derive(Clone)]
@@ -65,6 +75,10 @@ impl<S: KvStore> DbChainStore<S> {
         b"tip:"
     }
 
+    fn k_meta() -> &'static [u8] {
+        b"meta:"
+    }
+
     fn encode_tip(tip: ChainTip) -> Vec<u8> {
         const MAGIC: [u8; 8] = *b"EGG_TIP0";
         let mut out = Vec::with_capacity(48);
@@ -93,6 +107,42 @@ impl<S: KvStore> DbChainStore<S> {
         Ok(ChainTip {
             height,
             hash: Hash256(hash),
+        })
+    }
+
+    fn encode_meta(meta: ChainMeta) -> Vec<u8> {
+        const MAGIC: [u8; 8] = *b"EGG_MET0";
+        let mut out = Vec::with_capacity(8 + 4 + 32 + 32);
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&meta.chain_id.to_be_bytes());
+        out.extend_from_slice(&meta.genesis_id.0);
+        out.extend_from_slice(&meta.chainspec_hash.0);
+        out
+    }
+
+    fn decode_meta(bytes: &[u8]) -> Result<ChainMeta> {
+        const MAGIC: [u8; 8] = *b"EGG_MET0";
+        if bytes.len() < 8 + 4 + 32 + 32 {
+            return Err(StoreError::Decode("meta: unexpected eof".to_string()));
+        }
+        if &bytes[0..8] != MAGIC {
+            return Err(StoreError::Decode("meta: invalid magic".to_string()));
+        }
+        let cid_bytes: [u8; 4] = bytes[8..12]
+            .try_into()
+            .map_err(|_| StoreError::Decode("meta: bad chain_id bytes".to_string()))?;
+        let chain_id = u32::from_be_bytes(cid_bytes);
+
+        let mut genesis_id = [0u8; 32];
+        genesis_id.copy_from_slice(&bytes[12..44]);
+
+        let mut chainspec_hash = [0u8; 32];
+        chainspec_hash.copy_from_slice(&bytes[44..76]);
+
+        Ok(ChainMeta {
+            chain_id,
+            genesis_id: Hash256(genesis_id),
+            chainspec_hash: Hash256(chainspec_hash),
         })
     }
 }
@@ -149,6 +199,22 @@ impl<S: KvStore> ChainStore for DbChainStore<S> {
         }
         let val = self.kv.get(key)?;
         Ok(Some(Self::decode_tip(&val)?))
+    }
+
+    fn set_meta(&self, meta: ChainMeta) -> Result<()> {
+        let key = Self::k_meta().to_vec();
+        let val = Self::encode_meta(meta);
+        self.kv.put(key, val)?;
+        Ok(())
+    }
+
+    fn get_meta(&self) -> Result<Option<ChainMeta>> {
+        let key = Self::k_meta();
+        if !self.kv.has(key)? {
+            return Ok(None);
+        }
+        let val = self.kv.get(key)?;
+        Ok(Some(Self::decode_meta(&val)?))
     }
 }
 
@@ -216,5 +282,23 @@ mod tests {
 
         let back = store.get_tip().unwrap().expect("tip exists");
         assert_eq!(tip, back);
+    }
+
+    #[test]
+    fn store_meta_roundtrip() {
+        let kv = MemKv::new();
+        let store = DbChainStore::new(kv);
+
+        let meta = ChainMeta {
+            chain_id: 1,
+            genesis_id: Hash256([3u8; 32]),
+            chainspec_hash: Hash256([4u8; 32]),
+        };
+
+        assert_eq!(store.get_meta().unwrap(), None);
+        store.set_meta(meta).unwrap();
+
+        let back = store.get_meta().unwrap().expect("meta exists");
+        assert_eq!(meta, back);
     }
 }

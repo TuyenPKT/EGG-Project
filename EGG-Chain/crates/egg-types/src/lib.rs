@@ -28,6 +28,7 @@ pub struct BlockHeader {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
+    /// TxID theo chuẩn: hash của tx-body (payload) canonical-encoded, không chứa `id`.
     pub id: Hash256,
     pub payload: Vec<u8>,
 }
@@ -62,16 +63,21 @@ pub struct GenesisSpec {
 }
 
 pub mod canonical {
-    use super::{Block, BlockHeader, Hash256, Height, Transaction, HASH256_LEN};
+    use super::{
+        Block, BlockHeader, ChainSpec, GenesisSpec, Hash256, Height, Transaction, HASH256_LEN,
+    };
 
     const MAGIC_HDR: [u8; 8] = *b"EGG_HDR0";
     const MAGIC_TX: [u8; 8] = *b"EGG_TX0\0";
+    const MAGIC_TBD: [u8; 8] = *b"EGG_TBD0";
     const MAGIC_BLK: [u8; 8] = *b"EGG_BLK0";
+    const MAGIC_CSP: [u8; 8] = *b"EGG_CSP0";
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum CanonicalError {
         UnexpectedEof { at: usize, needed: usize, remaining: usize },
         InvalidMagic { at: usize },
+        InvalidUtf8 { at: usize },
         LengthOverflow { at: usize },
     }
 
@@ -84,6 +90,7 @@ pub mod canonical {
                     at, needed, remaining
                 ),
                 CanonicalError::InvalidMagic { at } => write!(f, "invalid magic at {}", at),
+                CanonicalError::InvalidUtf8 { at } => write!(f, "invalid utf8 at {}", at),
                 CanonicalError::LengthOverflow { at } => write!(f, "length overflow at {}", at),
             }
         }
@@ -155,6 +162,25 @@ pub mod canonical {
             }
             Ok(())
         }
+
+        fn take_bytes_len_u32(&mut self) -> Result<Vec<u8>> {
+            let at = self.pos;
+            let len = self.take_u32_be()? as usize;
+            if len > self.remaining() {
+                return Err(CanonicalError::UnexpectedEof {
+                    at,
+                    needed: len,
+                    remaining: self.remaining(),
+                });
+            }
+            Ok(self.take(len)?.to_vec())
+        }
+
+        fn take_string_len_u32(&mut self) -> Result<String> {
+            let at = self.pos;
+            let bytes = self.take_bytes_len_u32()?;
+            String::from_utf8(bytes).map_err(|_| CanonicalError::InvalidUtf8 { at })
+        }
     }
 
     fn push_u32_be(out: &mut Vec<u8>, v: u32) {
@@ -166,6 +192,22 @@ pub mod canonical {
     fn push_i64_be(out: &mut Vec<u8>, v: i64) {
         out.extend_from_slice(&v.to_be_bytes());
     }
+
+    fn push_bytes_len_u32(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+        let len_u32: u32 = bytes
+            .len()
+            .try_into()
+            .map_err(|_| CanonicalError::LengthOverflow { at: out.len() })?;
+        push_u32_be(out, len_u32);
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn push_string_len_u32(out: &mut Vec<u8>, s: &str) -> Result<()> {
+        push_bytes_len_u32(out, s.as_bytes())
+    }
+
+    // ---------------- BlockHeader ----------------
 
     pub fn encode_block_header(h: &BlockHeader) -> Vec<u8> {
         // Fixed-size: 8 + 32 + 8 + 8 + 8 + 32 + 4 = 100 bytes
@@ -199,13 +241,13 @@ pub mod canonical {
         })
     }
 
+    // ---------------- Transaction (wire/storage) ----------------
+    // encode_tx bao gồm `id` + `payload` (để truyền/lưu có thể verify).
+    // TxID chuẩn phải dùng encode_tx_body (không chứa id).
+
     pub fn encode_tx(tx: &Transaction) -> Vec<u8> {
         // 8 + 32 + 4 + payload
-        let payload_len_u32: u32 = tx
-            .payload
-            .len()
-            .try_into()
-            .unwrap_or(u32::MAX);
+        let payload_len_u32: u32 = tx.payload.len().try_into().unwrap_or(u32::MAX);
         let mut out = Vec::with_capacity(8 + 32 + 4 + tx.payload.len());
         out.extend_from_slice(&MAGIC_TX);
         out.extend_from_slice(&tx.id.0);
@@ -231,6 +273,37 @@ pub mod canonical {
         let payload = c.take(payload_len)?.to_vec();
         Ok(Transaction { id, payload })
     }
+
+    // ---------------- Transaction Body (for TxID) ----------------
+    // encode_tx_body chỉ chứa payload (không chứa id).
+
+    pub fn encode_tx_body(payload: &[u8]) -> Vec<u8> {
+        // 8 + 4 + payload
+        let len_u32: u32 = payload.len().try_into().unwrap_or(u32::MAX);
+        let mut out = Vec::with_capacity(8 + 4 + payload.len());
+        out.extend_from_slice(&MAGIC_TBD);
+        push_u32_be(&mut out, len_u32);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    pub fn decode_tx_body(bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut c = Cursor::new(bytes);
+        c.expect_magic(&MAGIC_TBD)?;
+        let payload_len = c.take_u32_be()? as usize;
+
+        let rem = c.remaining();
+        if rem < payload_len {
+            return Err(CanonicalError::UnexpectedEof {
+                at: c.pos,
+                needed: payload_len,
+                remaining: rem,
+            });
+        }
+        Ok(c.take(payload_len)?.to_vec())
+    }
+
+    // ---------------- Block ----------------
 
     pub fn encode_block(b: &Block) -> Vec<u8> {
         let mut out = Vec::new();
@@ -277,10 +350,50 @@ pub mod canonical {
         Ok(Block { header, txs })
     }
 
+    // ---------------- ChainSpec ----------------
+
+    pub fn encode_chainspec(spec: &ChainSpec) -> Vec<u8> {
+        // MAGIC + spec_version(u32) + chain_id(u32) + chain_name(len+bytes) +
+        // genesis.timestamp(i64) + genesis.pow_bits(u32) + genesis.nonce(u64)
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC_CSP);
+        push_u32_be(&mut out, spec.spec_version);
+        push_u32_be(&mut out, spec.chain.chain_id);
+
+        push_string_len_u32(&mut out, &spec.chain.chain_name)
+            .expect("encode_chainspec: chain_name length overflow");
+
+        push_i64_be(&mut out, spec.genesis.timestamp_utc);
+        push_u32_be(&mut out, spec.genesis.pow_difficulty_bits);
+        push_u64_be(&mut out, spec.genesis.nonce);
+        out
+    }
+
+    pub fn decode_chainspec(bytes: &[u8]) -> Result<ChainSpec> {
+        let mut c = Cursor::new(bytes);
+        c.expect_magic(&MAGIC_CSP)?;
+        let spec_version = c.take_u32_be()?;
+        let chain_id = c.take_u32_be()?;
+        let chain_name = c.take_string_len_u32()?;
+        let timestamp_utc = c.take_i64_be()?;
+        let pow_difficulty_bits = c.take_u32_be()?;
+        let nonce = c.take_u64_be()?;
+
+        Ok(ChainSpec {
+            spec_version,
+            chain: super::ChainParams { chain_name, chain_id },
+            genesis: GenesisSpec {
+                timestamp_utc,
+                pow_difficulty_bits,
+                nonce,
+            },
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{Hash256, Height};
+        use crate::{ChainParams, GenesisSpec, Hash256, Height};
 
         #[test]
         fn block_header_encoding_is_fixed_size() {
@@ -323,6 +436,14 @@ pub mod canonical {
         }
 
         #[test]
+        fn tx_body_roundtrip() {
+            let payload = vec![9, 8, 7, 6];
+            let enc = encode_tx_body(&payload);
+            let dec = decode_tx_body(&enc).unwrap();
+            assert_eq!(payload, dec);
+        }
+
+        #[test]
         fn block_roundtrip() {
             let b = Block {
                 header: BlockHeader {
@@ -355,6 +476,26 @@ pub mod canonical {
             let bytes = vec![0u8; 100];
             let err = decode_block_header(&bytes).unwrap_err();
             assert!(matches!(err, CanonicalError::InvalidMagic { .. }));
+        }
+
+        #[test]
+        fn chainspec_roundtrip() {
+            let spec = ChainSpec {
+                spec_version: 1,
+                chain: ChainParams {
+                    chain_name: "EGG-MAINNET".to_string(),
+                    chain_id: 1,
+                },
+                genesis: GenesisSpec {
+                    timestamp_utc: 1_700_000_000,
+                    pow_difficulty_bits: 0,
+                    nonce: 0,
+                },
+            };
+
+            let enc = encode_chainspec(&spec);
+            let dec = decode_chainspec(&enc).unwrap();
+            assert_eq!(spec, dec);
         }
     }
 }

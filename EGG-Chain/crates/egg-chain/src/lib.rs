@@ -3,7 +3,10 @@
 use egg_crypto::{hash_header, leading_zero_bits};
 use egg_types::{BlockHeader, Hash256};
 
+pub mod block_builder;
 pub mod chainspec;
+pub mod mempool;
+pub mod miner;
 pub mod state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
-use egg_types::{canonical, Block, BlockHeader, Hash256, Transaction};
+use egg_types::{canonical, Block, BlockHeader, ChainSpec, Hash256, Transaction};
 use serde::{Deserialize, Serialize};
+
+pub mod merkle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Domain(pub [u8; 16]);
@@ -16,6 +18,8 @@ impl Domain {
 pub const DOMAIN_BLOCK_HEADER: Domain = Domain::new(*b"EGG:HDR:V0\0\0\0\0\0\0");
 pub const DOMAIN_TX: Domain = Domain::new(*b"EGG:TX :V0\0\0\0\0\0\0");
 pub const DOMAIN_BLOCK: Domain = Domain::new(*b"EGG:BLK:V0\0\0\0\0\0\0");
+pub const DOMAIN_CHAINSPEC: Domain = Domain::new(*b"EGG:CSP:V0\0\0\0\0\0\0");
+pub const DOMAIN_MERKLE: Domain = Domain::new(*b"EGG:MRK:V0\0\0\0\0\0\0");
 
 pub fn hash_domain(domain: Domain, bytes: &[u8]) -> Hash256 {
     let mut hasher = Hasher::new();
@@ -30,14 +34,28 @@ pub fn hash_header(header: &BlockHeader) -> Hash256 {
     hash_domain(DOMAIN_BLOCK_HEADER, &enc)
 }
 
+/// TxID chuẩn: băm canonical tx-body (payload) KHÔNG chứa tx.id.
 pub fn hash_tx(tx: &Transaction) -> Hash256 {
-    let enc = canonical::encode_tx(tx);
+    tx_id_from_payload(&tx.payload)
+}
+
+pub fn tx_id_from_payload(payload: &[u8]) -> Hash256 {
+    let enc = canonical::encode_tx_body(payload);
     hash_domain(DOMAIN_TX, &enc)
+}
+
+pub fn validate_tx_id(tx: &Transaction) -> bool {
+    tx.id == tx_id_from_payload(&tx.payload)
 }
 
 pub fn hash_block(block: &Block) -> Hash256 {
     let enc = canonical::encode_block(block);
     hash_domain(DOMAIN_BLOCK, &enc)
+}
+
+pub fn hash_chainspec(spec: &ChainSpec) -> Hash256 {
+    let enc = canonical::encode_chainspec(spec);
+    hash_domain(DOMAIN_CHAINSPEC, &enc)
 }
 
 pub fn leading_zero_bits(h: &Hash256) -> u32 {
@@ -56,7 +74,7 @@ pub fn leading_zero_bits(h: &Hash256) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egg_types::{Height, Hash256};
+    use egg_types::{ChainParams, GenesisSpec, Height, Hash256};
 
     #[test]
     fn hash_is_deterministic_for_header() {
@@ -119,5 +137,50 @@ mod tests {
             }],
         };
         assert_eq!(hash_block(&b), hash_block(&b));
+    }
+
+    #[test]
+    fn hash_chainspec_is_deterministic() {
+        let spec = ChainSpec {
+            spec_version: 1,
+            chain: ChainParams {
+                chain_name: "EGG-MAINNET".to_string(),
+                chain_id: 1,
+            },
+            genesis: GenesisSpec {
+                timestamp_utc: 1_700_000_000,
+                pow_difficulty_bits: 0,
+                nonce: 0,
+            },
+        };
+        assert_eq!(hash_chainspec(&spec), hash_chainspec(&spec));
+    }
+
+    #[test]
+    fn txid_ignores_tx_id_field_and_is_deterministic_by_payload() {
+        let payload = b"same-payload".to_vec();
+
+        let a = Transaction {
+            id: Hash256([1u8; 32]),
+            payload: payload.clone(),
+        };
+        let b = Transaction {
+            id: Hash256([2u8; 32]),
+            payload: payload.clone(),
+        };
+
+        assert_eq!(hash_tx(&a), hash_tx(&b));
+        assert_eq!(hash_tx(&a), tx_id_from_payload(&payload));
+    }
+
+    #[test]
+    fn validate_tx_id_works() {
+        let payload = b"p".to_vec();
+        let id = tx_id_from_payload(&payload);
+        let ok = Transaction { id, payload: payload.clone() };
+        assert!(validate_tx_id(&ok));
+
+        let bad = Transaction { id: Hash256([9u8; 32]), payload };
+        assert!(!validate_tx_id(&bad));
     }
 }
