@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egg_chain::state::ChainState;
 use egg_crypto::hash_header;
@@ -12,6 +13,10 @@ use egg_net::peer::{handle_get_headers, HeaderProvider, PeerMachine, Role};
 use egg_net::protocol::{Message, Tip};
 
 const MAX_BLOCK_RETRIES: u8 = 2; // tổng attempt = 1 + MAX_BLOCK_RETRIES
+const BLOCK_WINDOW: usize = 16;
+const PER_REQ_RESEND_AFTER: Duration = Duration::from_secs(2);
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const IO_TICK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum NodeError {
@@ -48,6 +53,13 @@ impl From<FrameError> for NodeError {
 
 pub type Result<T> = std::result::Result<T, NodeError>;
 
+fn is_io_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 struct FramedTcp {
     stream: TcpStream,
     buf: Vec<u8>,
@@ -56,7 +68,8 @@ struct FramedTcp {
 impl FramedTcp {
     fn new(stream: TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // tick nhỏ để sync pipeline có thể "resend/abort" mà không treo chờ read quá lâu.
+        stream.set_read_timeout(Some(IO_TICK_TIMEOUT))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {
             stream,
@@ -117,7 +130,8 @@ pub fn run_responder_once<S: ChainStore + Clone>(
     let (stream, _) = listener.accept()?;
     let mut io = FramedTcp::new(stream)?;
 
-    let st = ChainState::open_or_init(store.clone(), spec).map_err(|e| NodeError::Chain(e.to_string()))?;
+    let st =
+        ChainState::open_or_init(store.clone(), spec).map_err(|e| NodeError::Chain(e.to_string()))?;
     let local_tip = Tip {
         height: st.tip.height.0,
         hash: st.tip.hash,
@@ -139,6 +153,7 @@ pub fn run_responder_once<S: ChainStore + Clone>(
     loop {
         let msg = match io.recv() {
             Ok(m) => m,
+            Err(NodeError::Io(e)) if is_io_timeout(&e) => continue,
             Err(NodeError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         };
@@ -180,6 +195,12 @@ pub fn run_responder_once<S: ChainStore + Clone>(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct InflightEntry {
+    retries: u8,
+    last_sent: Instant,
+}
+
 pub fn run_syncer_once<S: ChainStore + Clone>(
     addr: std::net::SocketAddr,
     spec: egg_types::ChainSpec,
@@ -189,7 +210,8 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
     let stream = TcpStream::connect(addr)?;
     let mut io = FramedTcp::new(stream)?;
 
-    let mut st = ChainState::open_or_init(store.clone(), spec).map_err(|e| NodeError::Chain(e.to_string()))?;
+    let mut st =
+        ChainState::open_or_init(store.clone(), spec).map_err(|e| NodeError::Chain(e.to_string()))?;
     let local_tip = Tip {
         height: st.tip.height.0,
         hash: st.tip.hash,
@@ -211,12 +233,39 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
         io.send(&m)?;
     }
 
-    // Phase 1: sync headers
+    // ---- Phase 1: sync headers ----
     let mut downloaded_ids: Vec<egg_types::Hash256> = Vec::new();
+    let mut last_progress = Instant::now();
+
     loop {
-        let msg = io.recv()?;
+        if Instant::now().duration_since(last_progress) > SESSION_IDLE_TIMEOUT {
+            return Err(NodeError::Protocol("header sync idle timeout".to_string()));
+        }
+
+        let msg = match io.recv() {
+            Ok(m) => m,
+            Err(NodeError::Io(e)) if is_io_timeout(&e) => continue,
+            Err(e) => return Err(e),
+        };
 
         if let Message::Headers { headers } = &msg {
+            if headers.is_empty() {
+                // kết thúc header sync
+                let out = peer.on_message(msg.clone());
+                for m in out {
+                    io.send(&m)?;
+                }
+                if peer.is_banned() {
+                    return Err(NodeError::Protocol(format!(
+                        "peer banned: {}",
+                        peer.ban_reason().unwrap_or("unknown")
+                    )));
+                }
+                break;
+            }
+
+            last_progress = Instant::now();
+
             for h in headers.iter().cloned() {
                 let id = hash_header(&h);
                 downloaded_ids.push(id);
@@ -235,102 +284,164 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
                 peer.ban_reason().unwrap_or("unknown")
             )));
         }
+    }
 
-        if matches!(msg, Message::Headers { headers } if headers.is_empty()) {
-            break;
+    // ---- Phase 2: pipeline download blocks ----
+    // build pending queue (dedupe) chỉ gồm id chưa có block
+    let mut pending: VecDeque<egg_types::Hash256> = VecDeque::new();
+    let mut seen: HashSet<egg_types::Hash256> = HashSet::new();
+    for id in downloaded_ids.into_iter() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let have = egg_db::store::BlockStore::has_block(st.store(), id)
+            .map_err(|e| NodeError::Chain(e.to_string()))?;
+        if !have {
+            pending.push_back(id);
         }
     }
 
-    // Phase 2: download blocks (retry on NotFound)
-    for id in downloaded_ids.into_iter() {
-        let have = egg_db::store::BlockStore::has_block(st.store(), id)
-            .map_err(|e| NodeError::Chain(e.to_string()))?;
-        if have {
-            continue;
-        }
+    let mut inflight: HashMap<egg_types::Hash256, InflightEntry> = HashMap::new();
+    last_progress = Instant::now();
 
-        let mut attempts: u8 = 0;
+    loop {
+        // fill window
+        let now = Instant::now();
+        while inflight.len() < BLOCK_WINDOW {
+            let Some(id) = pending.pop_front() else { break };
 
-        loop {
+            let have = egg_db::store::BlockStore::has_block(st.store(), id)
+                .map_err(|e| NodeError::Chain(e.to_string()))?;
+            if have {
+                continue;
+            }
+
             let req = peer.request_block(id);
             io.send(&req)?;
+            inflight.insert(
+                id,
+                InflightEntry {
+                    retries: 0,
+                    last_sent: now,
+                },
+            );
+        }
 
-            // đợi reply cho request này
-            loop {
-                let msg = io.recv()?;
+        if pending.is_empty() && inflight.is_empty() {
+            break;
+        }
 
-                let out = peer.on_message(msg.clone());
-                for m in out {
-                    io.send(&m)?;
+        if Instant::now().duration_since(last_progress) > SESSION_IDLE_TIMEOUT {
+            return Err(NodeError::Protocol(format!(
+                "block sync idle timeout: pending={} inflight={}",
+                pending.len(),
+                inflight.len()
+            )));
+        }
+
+        let maybe_msg = match io.recv() {
+            Ok(m) => Some(m),
+            Err(NodeError::Io(e)) if is_io_timeout(&e) => None,
+            Err(e) => return Err(e),
+        };
+
+        if let Some(msg) = maybe_msg {
+            let out = peer.on_message(msg.clone());
+            for m in out {
+                io.send(&m)?;
+            }
+
+            if peer.is_banned() {
+                return Err(NodeError::Protocol(format!(
+                    "peer banned: {}",
+                    peer.ban_reason().unwrap_or("unknown")
+                )));
+            }
+
+            match msg {
+                Message::BlockFound { id, block } => {
+                    let Some(_entry) = inflight.remove(&id) else {
+                        return Err(NodeError::Protocol(format!(
+                            "unexpected BlockFound {:?} (not inflight)",
+                            id
+                        )));
+                    };
+
+                    // node hardening: phải có header trước khi ingest
+                    let has_h = egg_db::store::BlockStore::has_header(st.store(), id)
+                        .map_err(|e| NodeError::Chain(e.to_string()))?;
+                    if !has_h {
+                        return Err(NodeError::Protocol(format!(
+                            "received BlockFound {:?} but local missing header",
+                            id
+                        )));
+                    }
+
+                    // hardening: block.header phải hash ra đúng id
+                    let hid = hash_header(&block.header);
+                    if hid != id {
+                        return Err(NodeError::Protocol(format!(
+                            "received BlockFound {:?} but block.header hashes to {:?}",
+                            id, hid
+                        )));
+                    }
+
+                    let _ = st
+                        .ingest_block(block)
+                        .map_err(|e| NodeError::Chain(e.to_string()))?;
+
+                    last_progress = Instant::now();
                 }
 
-                if peer.is_banned() {
-                    return Err(NodeError::Protocol(format!(
-                        "peer banned: {}",
-                        peer.ban_reason().unwrap_or("unknown")
-                    )));
+                Message::BlockNotFound { id } => {
+                    let Some(entry) = inflight.get_mut(&id) else {
+                        return Err(NodeError::Protocol(format!(
+                            "unexpected BlockNotFound {:?} (not inflight)",
+                            id
+                        )));
+                    };
+
+                    if entry.retries >= MAX_BLOCK_RETRIES {
+                        return Err(NodeError::Protocol(format!(
+                            "block {:?} not found after {} retries",
+                            id, MAX_BLOCK_RETRIES
+                        )));
+                    }
+
+                    entry.retries = entry.retries.saturating_add(1);
+                    entry.last_sent = Instant::now();
+
+                    let req = peer.request_block(id);
+                    io.send(&req)?;
                 }
 
-                match msg {
-                    Message::BlockFound { id: rid, block } => {
-                        if rid != id {
-                            return Err(NodeError::Protocol(format!(
-                                "BlockFound id mismatch: expected {:?} got {:?}",
-                                id, rid
-                            )));
-                        }
-
-                        // hardening tại node: phải có header trước khi ingest
-                        let has_h = egg_db::store::BlockStore::has_header(st.store(), rid)
-                            .map_err(|e| NodeError::Chain(e.to_string()))?;
-                        if !has_h {
-                            return Err(NodeError::Protocol(format!(
-                                "received BlockFound {:?} but local missing header",
-                                rid
-                            )));
-                        }
-
-                        // hardening: block.header phải hash ra đúng rid
-                        let hid = hash_header(&block.header);
-                        if hid != rid {
-                            return Err(NodeError::Protocol(format!(
-                                "received BlockFound {:?} but block.header hashes to {:?}",
-                                rid, hid
-                            )));
-                        }
-
-                        let _ = st.ingest_block(block).map_err(|e| NodeError::Chain(e.to_string()))?;
-                        break; // xong block này
-                    }
-                    Message::BlockNotFound { id: rid } => {
-                        if rid != id {
-                            return Err(NodeError::Protocol(format!(
-                                "BlockNotFound id mismatch: expected {:?} got {:?}",
-                                id, rid
-                            )));
-                        }
-
-                        if attempts >= MAX_BLOCK_RETRIES {
-                            return Err(NodeError::Protocol(format!(
-                                "block {:?} not found after {} retries",
-                                id, MAX_BLOCK_RETRIES
-                            )));
-                        }
-
-                        attempts = attempts.saturating_add(1);
-                        break; // break inner recv loop -> gửi request lại (retry)
-                    }
-                    _ => {
-                        // ignore, tiếp tục đợi reply
-                    }
+                _ => {}
+            }
+        } else {
+            // tick: resend theo per-id timeout
+            let now = Instant::now();
+            let mut resend_ids: Vec<egg_types::Hash256> = Vec::new();
+            for (id, entry) in inflight.iter() {
+                if now.duration_since(entry.last_sent) >= PER_REQ_RESEND_AFTER {
+                    resend_ids.push(*id);
                 }
             }
 
-            // nếu break ra do BlockFound thì đã break outer? không — cần kiểm tra đã có block rồi chưa
-            let now_have = egg_db::store::BlockStore::has_block(st.store(), id)
-                .map_err(|e| NodeError::Chain(e.to_string()))?;
-            if now_have {
-                break;
+            for id in resend_ids {
+                let Some(entry) = inflight.get_mut(&id) else { continue };
+
+                if entry.retries >= MAX_BLOCK_RETRIES {
+                    return Err(NodeError::Protocol(format!(
+                        "block {:?} timeout after {} retries",
+                        id, MAX_BLOCK_RETRIES
+                    )));
+                }
+
+                entry.retries = entry.retries.saturating_add(1);
+                entry.last_sent = now;
+
+                let req = peer.request_block(id);
+                io.send(&req)?;
             }
         }
     }
@@ -380,7 +491,11 @@ mod tests {
         Block { header, txs: vec![] }
     }
 
-    fn build_chain_with_blocks(store: DbChainStore<MemKv>, spec: ChainSpec, n_blocks: u64) -> Vec<Hash256> {
+    fn build_chain_with_blocks(
+        store: DbChainStore<MemKv>,
+        spec: ChainSpec,
+        n_blocks: u64,
+    ) -> Vec<Hash256> {
         let mut st = ChainState::open_or_init(store.clone(), spec).unwrap();
         let mut hashes = Vec::new();
 
