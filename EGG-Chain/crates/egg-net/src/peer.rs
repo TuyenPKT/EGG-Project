@@ -9,6 +9,10 @@ use crate::protocol::{Message, Tip};
 
 const MAX_NOTFOUND_PER_ID: u8 = 2;
 
+// Ban nếu peer trả BlockNotFound cho quá nhiều id khác nhau trong cùng session.
+// Mục tiêu: bắt pattern “không phục vụ/lying” khi đồng loạt NotFound nhiều block.
+const MAX_DISTINCT_NOTFOUND_IDS: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Inbound,
@@ -57,7 +61,10 @@ pub struct PeerMachine {
     banned: Option<String>,
     known_header_ids: HashSet<Hash256>,
     inflight_blocks: HashSet<Hash256>,
+
+    // notfound tracking
     notfound_by_id: HashMap<Hash256, u8>,
+    notfound_distinct_ids: HashSet<Hash256>,
 }
 
 impl PeerMachine {
@@ -77,6 +84,7 @@ impl PeerMachine {
             known_header_ids: known,
             inflight_blocks: HashSet::new(),
             notfound_by_id: HashMap::new(),
+            notfound_distinct_ids: HashSet::new(),
         }
     }
 
@@ -183,13 +191,29 @@ impl PeerMachine {
     fn hardening_on_notfound(&mut self, id: Hash256) {
         let c = self.notfound_by_id.entry(id).or_insert(0);
         *c = c.saturating_add(1);
+
+        // Ban theo “per-id”
         if *c > MAX_NOTFOUND_PER_ID {
             self.ban(format!("too many BlockNotFound for {:?}", id));
+            return;
+        }
+
+        // Ban theo “nhiều id khác nhau”
+        // Chỉ tính distinct khi đây là lần NotFound đầu tiên của id (c == 1).
+        if *c == 1 {
+            self.notfound_distinct_ids.insert(id);
+            if self.notfound_distinct_ids.len() > MAX_DISTINCT_NOTFOUND_IDS {
+                self.ban(format!(
+                    "too many distinct BlockNotFound ids: {}",
+                    self.notfound_distinct_ids.len()
+                ));
+            }
         }
     }
 
     fn hardening_on_found(&mut self, id: Hash256) {
         self.notfound_by_id.remove(&id);
+        self.notfound_distinct_ids.remove(&id);
     }
 
     pub fn on_message(&mut self, msg: Message) -> Vec<Message> {
@@ -269,7 +293,7 @@ impl PeerMachine {
                     return vec![];
                 }
 
-                // hardening bổ sung: id phải khớp header hash
+                // hardening: id phải khớp header hash
                 let hid = hash_header(&block.header);
                 if hid != id {
                     self.ban(format!("BlockFound id mismatch: expect {:?} got {:?}", id, hid));
@@ -388,7 +412,6 @@ mod tests {
         let id = hash_header(&h);
         let _ = p.on_message(Message::Headers { headers: vec![h] });
 
-        // request + notfound nhiều lần
         for i in 0..=MAX_NOTFOUND_PER_ID {
             let _ = p.request_block(id);
             let _ = p.on_message(Message::BlockNotFound { id });
@@ -398,7 +421,46 @@ mod tests {
         }
 
         assert!(p.is_banned());
-        assert!(p.ban_reason().unwrap().contains("too many"));
+        assert!(p.ban_reason().unwrap().contains("too many BlockNotFound"));
+    }
+
+    #[test]
+    fn ban_after_too_many_distinct_notfound_ids() {
+        let mut p = PeerMachine::new(Role::Outbound, mk_local());
+        let _ = p.on_message(mk_ack());
+        assert!(p.is_ready());
+
+        // Tạo nhiều header khác nhau để “known header” cho các id.
+        let mut headers = Vec::new();
+        for i in 1..=(MAX_DISTINCT_NOTFOUND_IDS as u64 + 1) {
+            headers.push(hdr(Hash256::zero(), i, 10_000 + i));
+        }
+        let _ = p.on_message(Message::Headers { headers: headers.clone() });
+
+        // Mỗi id: request 1 lần rồi trả NotFound 1 lần.
+        // Không bị ban cho đến khi vượt ngưỡng distinct.
+        for (idx, h) in headers.into_iter().enumerate() {
+            let id = hash_header(&h);
+
+            let _ = p.request_block(id);
+            let _ = p.on_message(Message::BlockNotFound { id });
+
+            if idx < MAX_DISTINCT_NOTFOUND_IDS {
+                assert!(
+                    !p.is_banned(),
+                    "should not be banned yet at idx={}",
+                    idx
+                );
+            } else {
+                assert!(p.is_banned(), "should be banned at idx={}", idx);
+                assert!(
+                    p.ban_reason().unwrap().contains("distinct BlockNotFound"),
+                    "unexpected ban reason: {:?}",
+                    p.ban_reason()
+                );
+                break;
+            }
+        }
     }
 
     #[test]
