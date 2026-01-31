@@ -35,7 +35,8 @@ pub enum Message {
 
     // block download
     GetBlock { id: Hash256 },
-    Block { id: Hash256, block: Option<Block> },
+    BlockFound { id: Hash256, block: Block },
+    BlockNotFound { id: Hash256 },
 
     // keepalive
     Ping { nonce: u64 },
@@ -207,7 +208,8 @@ const TAG_GET_HEADERS: u8 = 10;
 const TAG_HEADERS: u8 = 11;
 
 const TAG_GET_BLOCK: u8 = 12;
-const TAG_BLOCK: u8 = 13;
+const TAG_BLOCK_FOUND: u8 = 13;
+const TAG_BLOCK_NOT_FOUND: u8 = 14;
 
 const TAG_PING: u8 = 20;
 const TAG_PONG: u8 = 21;
@@ -267,20 +269,15 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>> {
             push_u8(&mut out, TAG_GET_BLOCK);
             push_hash256(&mut out, *id);
         }
-        Message::Block { id, block } => {
-            push_u8(&mut out, TAG_BLOCK);
+        Message::BlockFound { id, block } => {
+            push_u8(&mut out, TAG_BLOCK_FOUND);
             push_hash256(&mut out, *id);
-
-            match block {
-                None => {
-                    push_u8(&mut out, 0);
-                }
-                Some(b) => {
-                    push_u8(&mut out, 1);
-                    let bb = canonical::encode_block(b);
-                    push_bytes_len_u32(&mut out, &bb)?;
-                }
-            }
+            let bb = canonical::encode_block(block);
+            push_bytes_len_u32(&mut out, &bb)?;
+        }
+        Message::BlockNotFound { id } => {
+            push_u8(&mut out, TAG_BLOCK_NOT_FOUND);
+            push_hash256(&mut out, *id);
         }
         Message::Ping { nonce } => {
             push_u8(&mut out, TAG_PING);
@@ -353,19 +350,15 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message> {
             let id = c.take_hash256()?;
             Ok(Message::GetBlock { id })
         }
-        TAG_BLOCK => {
+        TAG_BLOCK_FOUND => {
             let id = c.take_hash256()?;
-            let flag = c.take_u8()?;
-            match flag {
-                0 => Ok(Message::Block { id, block: None }),
-                1 => {
-                    let bb = c.take_bytes_len_u32()?;
-                    let b = canonical::decode_block(&bb)
-                        .map_err(|e| ProtocolError::Canonical(e.to_string()))?;
-                    Ok(Message::Block { id, block: Some(b) })
-                }
-                other => Err(ProtocolError::InvalidTag { tag: other }),
-            }
+            let bb = c.take_bytes_len_u32()?;
+            let b = canonical::decode_block(&bb).map_err(|e| ProtocolError::Canonical(e.to_string()))?;
+            Ok(Message::BlockFound { id, block: b })
+        }
+        TAG_BLOCK_NOT_FOUND => {
+            let id = c.take_hash256()?;
+            Ok(Message::BlockNotFound { id })
         }
         TAG_PING => {
             let nonce = c.take_u64_be()?;
@@ -424,23 +417,26 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_block_empty_txs_header_matches() {
+    fn roundtrip_block_found() {
         let blk = Block {
             header: sample_header(7, 3),
             txs: vec![],
         };
-        let m = Message::Block {
+        let m = Message::BlockFound {
             id: Hash256([3u8; 32]),
-            block: Some(blk.clone()),
+            block: blk.clone(),
         };
 
         let enc = encode_message(&m).unwrap();
         let dec = decode_message(&enc).unwrap();
+        assert_eq!(m, dec);
+    }
 
-        let Message::Block { id, block } = dec else { panic!("expected Block"); };
-        assert_eq!(id, Hash256([3u8; 32]));
-        let b = block.expect("expected Some(block)");
-        assert_eq!(b.header, blk.header);
-        assert_eq!(b.txs.len(), 0);
+    #[test]
+    fn roundtrip_block_not_found() {
+        let m = Message::BlockNotFound { id: Hash256([4u8; 32]) };
+        let enc = encode_message(&m).unwrap();
+        let dec = decode_message(&enc).unwrap();
+        assert_eq!(m, dec);
     }
 }

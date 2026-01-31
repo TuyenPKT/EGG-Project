@@ -11,6 +11,8 @@ use egg_net::codec::{decode_frame, encode_frame, FrameError};
 use egg_net::peer::{handle_get_headers, HeaderProvider, PeerMachine, Role};
 use egg_net::protocol::{Message, Tip};
 
+const MAX_BLOCK_RETRIES: u8 = 2; // tổng attempt = 1 + MAX_BLOCK_RETRIES
+
 #[derive(Debug)]
 pub enum NodeError {
     Io(std::io::Error),
@@ -163,11 +165,11 @@ pub fn run_responder_once<S: ChainStore + Clone>(
                     let have = egg_db::store::BlockStore::has_block(st.store(), id)
                         .map_err(|e| NodeError::Chain(e.to_string()))?;
                     if !have {
-                        io.send(&Message::Block { id, block: None })?;
+                        io.send(&Message::BlockNotFound { id })?;
                     } else {
                         let blk = egg_db::store::BlockStore::get_block(st.store(), id)
                             .map_err(|e| NodeError::Chain(e.to_string()))?;
-                        io.send(&Message::Block { id, block: Some(blk) })?;
+                        io.send(&Message::BlockFound { id, block: blk })?;
                     }
                 }
                 _ => {}
@@ -239,7 +241,7 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
         }
     }
 
-    // Phase 2: download blocks (hardening: chỉ nhận Block nếu header đã có)
+    // Phase 2: download blocks (retry on NotFound)
     for id in downloaded_ids.into_iter() {
         let have = egg_db::store::BlockStore::has_block(st.store(), id)
             .map_err(|e| NodeError::Chain(e.to_string()))?;
@@ -247,50 +249,88 @@ pub fn run_syncer_once<S: ChainStore + Clone>(
             continue;
         }
 
-        let req = peer.request_block(id);
-        io.send(&req)?;
+        let mut attempts: u8 = 0;
 
         loop {
-            let msg = io.recv()?;
+            let req = peer.request_block(id);
+            io.send(&req)?;
 
-            let out = peer.on_message(msg.clone());
-            for m in out {
-                io.send(&m)?;
-            }
+            // đợi reply cho request này
+            loop {
+                let msg = io.recv()?;
 
-            if peer.is_banned() {
-                return Err(NodeError::Protocol(format!(
-                    "peer banned: {}",
-                    peer.ban_reason().unwrap_or("unknown")
-                )));
-            }
-
-            match msg {
-                Message::Block { id: rid, block } => {
-                    if rid != id {
-                        return Err(NodeError::Protocol(format!(
-                            "block response id mismatch: expected {:?} got {:?}",
-                            id, rid
-                        )));
-                    }
-
-                    let has_h = egg_db::store::BlockStore::has_header(st.store(), rid)
-                        .map_err(|e| NodeError::Chain(e.to_string()))?;
-                    if !has_h {
-                        return Err(NodeError::Protocol(format!(
-                            "received block {:?} but local missing header",
-                            rid
-                        )));
-                    }
-
-                    let Some(b) = block else {
-                        return Err(NodeError::Protocol(format!("block not found for {:?}", id)));
-                    };
-
-                    let _ = st.ingest_block(b).map_err(|e| NodeError::Chain(e.to_string()))?;
-                    break;
+                let out = peer.on_message(msg.clone());
+                for m in out {
+                    io.send(&m)?;
                 }
-                _ => {}
+
+                if peer.is_banned() {
+                    return Err(NodeError::Protocol(format!(
+                        "peer banned: {}",
+                        peer.ban_reason().unwrap_or("unknown")
+                    )));
+                }
+
+                match msg {
+                    Message::BlockFound { id: rid, block } => {
+                        if rid != id {
+                            return Err(NodeError::Protocol(format!(
+                                "BlockFound id mismatch: expected {:?} got {:?}",
+                                id, rid
+                            )));
+                        }
+
+                        // hardening tại node: phải có header trước khi ingest
+                        let has_h = egg_db::store::BlockStore::has_header(st.store(), rid)
+                            .map_err(|e| NodeError::Chain(e.to_string()))?;
+                        if !has_h {
+                            return Err(NodeError::Protocol(format!(
+                                "received BlockFound {:?} but local missing header",
+                                rid
+                            )));
+                        }
+
+                        // hardening: block.header phải hash ra đúng rid
+                        let hid = hash_header(&block.header);
+                        if hid != rid {
+                            return Err(NodeError::Protocol(format!(
+                                "received BlockFound {:?} but block.header hashes to {:?}",
+                                rid, hid
+                            )));
+                        }
+
+                        let _ = st.ingest_block(block).map_err(|e| NodeError::Chain(e.to_string()))?;
+                        break; // xong block này
+                    }
+                    Message::BlockNotFound { id: rid } => {
+                        if rid != id {
+                            return Err(NodeError::Protocol(format!(
+                                "BlockNotFound id mismatch: expected {:?} got {:?}",
+                                id, rid
+                            )));
+                        }
+
+                        if attempts >= MAX_BLOCK_RETRIES {
+                            return Err(NodeError::Protocol(format!(
+                                "block {:?} not found after {} retries",
+                                id, MAX_BLOCK_RETRIES
+                            )));
+                        }
+
+                        attempts = attempts.saturating_add(1);
+                        break; // break inner recv loop -> gửi request lại (retry)
+                    }
+                    _ => {
+                        // ignore, tiếp tục đợi reply
+                    }
+                }
+            }
+
+            // nếu break ra do BlockFound thì đã break outer? không — cần kiểm tra đã có block rồi chưa
+            let now_have = egg_db::store::BlockStore::has_block(st.store(), id)
+                .map_err(|e| NodeError::Chain(e.to_string()))?;
+            if now_have {
+                break;
             }
         }
     }

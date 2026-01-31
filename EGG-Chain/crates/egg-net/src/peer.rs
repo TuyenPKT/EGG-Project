@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use egg_crypto::hash_header;
 use egg_types::{BlockHeader, Hash256};
 
 use crate::protocol::{Message, Tip};
+
+const MAX_NOTFOUND_PER_ID: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -55,6 +57,7 @@ pub struct PeerMachine {
     banned: Option<String>,
     known_header_ids: HashSet<Hash256>,
     inflight_blocks: HashSet<Hash256>,
+    notfound_by_id: HashMap<Hash256, u8>,
 }
 
 impl PeerMachine {
@@ -73,6 +76,7 @@ impl PeerMachine {
             banned: None,
             known_header_ids: known,
             inflight_blocks: HashSet::new(),
+            notfound_by_id: HashMap::new(),
         }
     }
 
@@ -160,6 +164,34 @@ impl PeerMachine {
         }
     }
 
+    fn hardening_on_block_reply(&mut self, id: Hash256) -> bool {
+        // 1) unsolicited reply -> ban
+        if !self.inflight_blocks.remove(&id) {
+            self.ban(format!("unsolicited block reply {:?}", id));
+            return false;
+        }
+
+        // 2) reply nhưng chưa biết header -> ban
+        if !self.known_header_ids.contains(&id) {
+            self.ban(format!("block reply without known header {:?}", id));
+            return false;
+        }
+
+        true
+    }
+
+    fn hardening_on_notfound(&mut self, id: Hash256) {
+        let c = self.notfound_by_id.entry(id).or_insert(0);
+        *c = c.saturating_add(1);
+        if *c > MAX_NOTFOUND_PER_ID {
+            self.ban(format!("too many BlockNotFound for {:?}", id));
+        }
+    }
+
+    fn hardening_on_found(&mut self, id: Hash256) {
+        self.notfound_by_id.remove(&id);
+    }
+
     pub fn on_message(&mut self, msg: Message) -> Vec<Message> {
         if self.is_banned() {
             return vec![];
@@ -209,7 +241,7 @@ impl PeerMachine {
             Message::GetHeaders { start: _, max: _ } => vec![],
 
             Message::Headers { headers } => {
-                // luôn ghi nhận known headers (hardening), dù sync_enabled hay không
+                // hardening: ghi nhận known header ids
                 for h in headers.iter() {
                     let id = hash_header(h);
                     self.known_header_ids.insert(id);
@@ -232,19 +264,28 @@ impl PeerMachine {
 
             Message::GetBlock { id: _ } => vec![],
 
-            Message::Block { id, block: _ } => {
-                // 1) unsolicited block -> ban
-                if !self.inflight_blocks.remove(&id) {
-                    self.ban(format!("unsolicited block {:?}", id));
+            Message::BlockFound { id, block } => {
+                if !self.hardening_on_block_reply(id) {
                     return vec![];
                 }
 
-                // 2) block nhưng chưa biết header id -> ban
-                if !self.known_header_ids.contains(&id) {
-                    self.ban(format!("block without known header {:?}", id));
+                // hardening bổ sung: id phải khớp header hash
+                let hid = hash_header(&block.header);
+                if hid != id {
+                    self.ban(format!("BlockFound id mismatch: expect {:?} got {:?}", id, hid));
                     return vec![];
                 }
 
+                self.hardening_on_found(id);
+                vec![]
+            }
+
+            Message::BlockNotFound { id } => {
+                if !self.hardening_on_block_reply(id) {
+                    return vec![];
+                }
+
+                self.hardening_on_notfound(id);
                 vec![]
             }
 
@@ -266,7 +307,7 @@ pub fn handle_get_headers<P: HeaderProvider>(p: &P, start: Hash256, max: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egg_types::{Hash256, Height};
+    use egg_types::{Block, Hash256, Height};
 
     fn hdr(parent: Hash256, height: u64, nonce: u64) -> BlockHeader {
         BlockHeader {
@@ -307,20 +348,23 @@ mod tests {
     }
 
     #[test]
-    fn ban_on_unsolicited_block() {
+    fn ban_on_unsolicited_block_found() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
         let _ = p.on_message(mk_ack());
         assert!(p.is_ready());
 
-        let id = Hash256([7u8; 32]);
-        let _ = p.on_message(Message::Block { id, block: None });
+        let h = hdr(Hash256::zero(), 1, 1);
+        let id = hash_header(&h);
+        let blk = Block { header: h, txs: vec![] };
+
+        let _ = p.on_message(Message::BlockFound { id, block: blk });
 
         assert!(p.is_banned());
         assert!(p.ban_reason().unwrap().contains("unsolicited"));
     }
 
     #[test]
-    fn ban_on_block_without_known_header_even_if_requested() {
+    fn ban_on_block_not_found_without_known_header_even_if_requested() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
         let _ = p.on_message(mk_ack());
         assert!(p.is_ready());
@@ -328,25 +372,48 @@ mod tests {
         let id = Hash256([8u8; 32]);
         let _req = p.request_block(id);
 
-        let _ = p.on_message(Message::Block { id, block: None });
+        let _ = p.on_message(Message::BlockNotFound { id });
 
         assert!(p.is_banned());
         assert!(p.ban_reason().unwrap().contains("without known header"));
     }
 
     #[test]
-    fn accept_block_when_requested_and_header_known() {
+    fn ban_after_too_many_notfound_for_same_id() {
         let mut p = PeerMachine::new(Role::Outbound, mk_local());
         let _ = p.on_message(mk_ack());
         assert!(p.is_ready());
 
-        // đưa 1 header vào known set qua Message::Headers
         let h = hdr(Hash256::zero(), 1, 123);
         let id = hash_header(&h);
         let _ = p.on_message(Message::Headers { headers: vec![h] });
 
+        // request + notfound nhiều lần
+        for i in 0..=MAX_NOTFOUND_PER_ID {
+            let _ = p.request_block(id);
+            let _ = p.on_message(Message::BlockNotFound { id });
+            if i < MAX_NOTFOUND_PER_ID {
+                assert!(!p.is_banned());
+            }
+        }
+
+        assert!(p.is_banned());
+        assert!(p.ban_reason().unwrap().contains("too many"));
+    }
+
+    #[test]
+    fn accept_block_found_when_requested_and_header_known() {
+        let mut p = PeerMachine::new(Role::Outbound, mk_local());
+        let _ = p.on_message(mk_ack());
+        assert!(p.is_ready());
+
+        let h = hdr(Hash256::zero(), 1, 123);
+        let id = hash_header(&h);
+        let _ = p.on_message(Message::Headers { headers: vec![h.clone()] });
+
         let _req = p.request_block(id);
-        let _ = p.on_message(Message::Block { id, block: None });
+        let blk = Block { header: h, txs: vec![] };
+        let _ = p.on_message(Message::BlockFound { id, block: blk });
 
         assert!(!p.is_banned());
     }
